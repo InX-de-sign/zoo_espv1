@@ -1,0 +1,22 @@
+rtspAddress: :8554
+rtmpAddress: :1935
+hlsAddress: :8888
+webrtcAddress: :8889
+
+# Remove the invalid readBufferCount lines
+paths:
+  cam1:
+    source: publisher
+    sourceProtocol: automatic
+
+  cam2:
+    source: publisher
+    sourceProtocol: automatic
+
+  audio1:
+    source: publisher
+    sourceProtocol: automatic
+  
+  audio2:
+    source: publisher
+    sourceProtocol: automatic

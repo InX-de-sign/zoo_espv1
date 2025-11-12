@@ -1,0 +1,7 @@
+".env" 
+ISDN3001-YOLO-CV-Training/"inference/models/best_*.onnx" 
+"!inference/models/best.onnx" 
+_Archived
+.venv/
+.vscode/
+__pycache__/
