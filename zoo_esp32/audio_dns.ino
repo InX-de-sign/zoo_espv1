@@ -20,7 +20,7 @@ const char* ssid = "ISD-Project-22Fall";         // ← CHANGE to your shared Wi
 const char* password = "isd@2022Fall";     // ← CHANGE to WiFi password
 
 // ==================== SERVER CONFIGURATION ====================
-const char* SERVER_HOST = "100.88.240.42"; // ipconfig
+const char* SERVER_HOST = "192.168.50.193"; // ipconfig
 const int SERVER_PORT = 8000;               // Docker chatbot port :8000
 const char* WEBSOCKET_PATH = "/ws/esp32/audio/esp32_teammate"; // WebSocket endpoint
 

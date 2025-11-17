@@ -340,7 +340,14 @@
         }
 
         function initWebSocket() {
-            ws = new WebSocket('ws://localhost:9001/ws');
+            // ws = new WebSocket('ws://localhost:9001/ws');
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            // const ws = new WebSocket(wsUrl);
+
+            console.log('Connecting to WebSocket:', wsUrl);
+
+            ws = new WebSocket(wsUrl);
 
             ws.onopen = function () {
                 console.log('Connected to zoo chatbot');
@@ -390,8 +397,18 @@
 
             ws.onerror = function (error) {
                 console.error('WebSocket error:', error);
+                addMessage('Connection error. Check console for details.', 'system');
             };
         }
+
+        // Initialize on load
+        window.onload = function () {
+            console.log('Page loaded, initializing WebSocket...');
+            console.log('Current URL:', window.location.href);
+            console.log('Protocol:', window.location.protocol);
+            console.log('Host:', window.location.host);
+            initWebSocket();
+        };
 
         function addMessage(text, sender) {
             const messages = document.getElementById('messages');

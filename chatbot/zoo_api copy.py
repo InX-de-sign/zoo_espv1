@@ -1,5 +1,5 @@
-# zoo_api.py - FastAPI for Zoo chatbot (PORT 8000)
-from fastapi import FastAPI, WebSocket
+# zoo_api.py - FastAPI for Zoo chatbot with ESP32 support
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 import asyncio
@@ -15,14 +15,24 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Ocean Park Zoo Chatbot API")
 
-# Import zoo components
+# Import components
 from zoo_main import HybridZooAI
 from config import load_azure_openai_config
+from optimized_voice import OptimizedVoiceComponent
+from audio_receiver import AudioReceiver
 
+# Initialize components
 openai_config = load_azure_openai_config()
 assistant = HybridZooAI(openai_api_key=openai_config.api_key, db_path="zoo.db")
+voice_component = OptimizedVoiceComponent()
 
-# Mount static files if they exist
+# Initialize audio receiver with ESP32 support
+audio_receiver = AudioReceiver(
+    voice_component=voice_component,
+    assistant=assistant
+)
+
+# Mount static files
 if os.path.exists("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -39,66 +49,115 @@ async def root():
             <head><title>Ocean Park Zoo Chatbot</title></head>
             <body>
                 <h1>🐼 Ocean Park Zoo Chatbot</h1>
-                <p>WebSocket endpoint: ws://localhost:8000/ws</p>
-                <p>Create a file at static/zoo_index.html for the full interface</p>
+                <h2>WebSocket Endpoints:</h2>
+                <ul>
+                    <li><strong>Web Chat:</strong> ws://localhost:8000/ws</li>
+                    <li><strong>ESP32 Audio:</strong> ws://localhost:8000/ws/esp32/audio/{client_id}</li>
+                    <li><strong>RPi Audio (legacy):</strong> ws://localhost:8000/ws/audio/{client_id}</li>
+                </ul>
             </body>
         </html>
         """)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket for real-time chat"""
+    """WebSocket for web-based real-time chat"""
     await websocket.accept()
     
-    client_id = f"user_{hash(str(websocket.client))}_{int(asyncio.get_event_loop().time())}"[-10:]
-    logger.info(f"🐼 Zoo client connected: {client_id}")
+    client_id = f"web_{hash(str(websocket.client))}_{int(asyncio.get_event_loop().time())}"[-10:]
+    logger.info(f"🐼 Web client connected: {client_id}")
     
     try:
-        # Send welcome message
         await websocket.send_json({
             "type": "system",
-            "message": "Welcome to Ocean Park! I'm your zoo guide! Ask me about anything that interests you!"
+            "message": "Welcome to Ocean Park! I'm your zoo guide!"
         })
         
         while True:
-            # Receive message
             data = await websocket.receive_json()
             message = data.get("message", "")
             
             if not message:
                 continue
             
-            logger.info(f"Zoo query from {client_id}: {message}")
+            logger.info(f"Query from {client_id}: {message}")
             
-            # Send thinking indicator
             await websocket.send_json({
                 "type": "thinking",
-                "message": "Let me check our animal database..."
+                "message": "Let me check..."
             })
             
             try:
-                # Process with zoo AI
                 response = await assistant.process_message(message, client_id)
                 
-                # Send response
                 await websocket.send_json({
                     "type": "response",
                     "message": response
                 })
                 
-                logger.info(f"Zoo response sent to {client_id}")
-                
             except Exception as e:
                 logger.error(f"Processing error: {e}")
                 await websocket.send_json({
                     "type": "error",
-                    "message": "Sorry, I had trouble with that question. Can you try asking differently?"
+                    "message": "Sorry, I had trouble with that question."
                 })
     
+    except WebSocketDisconnect:
+        logger.info(f"Web client disconnected: {client_id}")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
-    finally:
-        logger.info(f"🐼 Zoo client disconnected: {client_id}")
+
+@app.websocket("/ws/esp32/audio/{client_id}")
+async def esp32_audio_endpoint(websocket: WebSocket, client_id: str):
+    """
+    🆕 ESP32 Audio WebSocket - COMPLETE WORKFLOW
+    
+    This endpoint handles:
+    1. Receives audio chunks from ESP32
+    2. Transcribes with Google STT
+    3. Processes with OpenAI
+    4. Generates Google TTS
+    5. Converts to ESP32 format (16kHz WAV)
+    6. Streams audio back to ESP32
+    
+    Protocol:
+    - ESP32 sends: {"type": "register", "audio_settings": {...}}
+    - ESP32 sends: {"type": "audio_chunk", "audio": "base64...", "chunk_id": 0}
+    - ESP32 sends: {"type": "audio_complete", "total_chunks": 100}
+    - Server sends: {"type": "stt_result", "text": "..."}
+    - Server sends: {"type": "tts_start", "total_bytes": 50000, ...}
+    - Server sends: binary audio chunks
+    - Server sends: {"type": "tts_complete", "total_bytes": 50000}
+    """
+    await websocket.accept()
+    logger.info(f"🎤 ESP32 audio client connected: {client_id}")
+    
+    try:
+        # Wait for registration
+        first_message = await websocket.receive_json()
+        
+        # Handle with audio receiver (supports complete workflow)
+        await audio_receiver.handle_client_with_id(websocket, client_id, first_message)
+        
+    except WebSocketDisconnect:
+        logger.info(f"🔌 ESP32 disconnected: {client_id}")
+    except Exception as e:
+        logger.error(f"❌ ESP32 error: {e}", exc_info=True)
+
+@app.websocket("/ws/audio/{client_id}")
+async def rpi_audio_endpoint(websocket: WebSocket, client_id: str):
+    """Legacy endpoint for Raspberry Pi clients"""
+    await websocket.accept()
+    logger.info(f"🎤 RPi audio client connected: {client_id}")
+    
+    try:
+        first_message = await websocket.receive_json()
+        await audio_receiver.handle_client_with_id(websocket, client_id, first_message)
+        
+    except WebSocketDisconnect:
+        logger.info(f"🔌 RPi disconnected: {client_id}")
+    except Exception as e:
+        logger.error(f"❌ RPi error: {e}", exc_info=True)
 
 @app.get("/health")
 async def health_check():
@@ -107,9 +166,39 @@ async def health_check():
         "status": "healthy",
         "service": "Ocean Park Zoo Chatbot",
         "port": 8000,
-        "openai_available": True,
-        "database": assistant.db_path if hasattr(assistant, 'db_path') else "unknown"
+        "endpoints": {
+            "web_chat": "ws://localhost:8000/ws",
+            "esp32_audio": "ws://localhost:8000/ws/esp32/audio/{client_id}",
+            "rpi_audio": "ws://localhost:8000/ws/audio/{client_id}"
+        },
+        "components": {
+            "openai": True,
+            "google_tts": voice_component.tts_available,
+            "google_stt": voice_component.recognizer is not None,
+            "database": os.path.exists(assistant.db_path) if hasattr(assistant, 'db_path') else False
+        }
     }
+
+@app.get("/test-audio")
+async def test_audio():
+    """Test audio components"""
+    try:
+        # Test TTS
+        test_text = "Hello! This is a test of the Google TTS system."
+        audio = await voice_component.create_audio_response_async(test_text)
+        
+        return {
+            "status": "success",
+            "tts_available": voice_component.tts_available,
+            "stt_available": voice_component.recognizer is not None,
+            "test_audio_size": len(audio) if audio else 0,
+            "message": "Audio components working" if audio else "TTS failed"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
 
 @app.get("/test-database")
 async def test_database():
@@ -123,11 +212,9 @@ async def test_database():
         conn = sqlite3.connect(assistant.db_path)
         cursor = conn.cursor()
         
-        # Get animal count
         cursor.execute("SELECT COUNT(*) FROM animals")
         count = cursor.fetchone()[0]
         
-        # Get sample animals
         cursor.execute("SELECT common_name, scientific_name, location_at_park FROM animals LIMIT 5")
         samples = cursor.fetchall()
         
@@ -183,58 +270,21 @@ async def list_animals():
     except Exception as e:
         return {"error": str(e)}
 
-@app.get("/api/animal/{animal_name}")
-async def get_animal_info(animal_name: str):
-    """Get detailed information about a specific animal"""
-    try:
-        import sqlite3
-        
-        if not assistant.db_path or not os.path.exists(assistant.db_path):
-            return {"error": "Database not found"}
-        
-        conn = sqlite3.connect(assistant.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT *
-            FROM animals
-            WHERE LOWER(common_name) LIKE ?
-        ''', (f'%{animal_name.lower()}%',))
-        
-        result = cursor.fetchone()
-        conn.close()
-        
-        if not result:
-            return {"error": "Animal not found", "searched_for": animal_name}
-        
-        # Map to column names
-        columns = ['id', 'common_name', 'scientific_name', 'distribution_range', 'habitat',
-                  'phylum', 'class', 'order_name', 'family', 'genus',
-                  'characteristics', 'body_measurements', 'diet', 'behavior',
-                  'location_at_park', 'stories', 'conservation_status', 'threats', 'conservation_actions']
-        
-        animal_data = dict(zip(columns, result))
-        return animal_data
-        
-    except Exception as e:
-        return {"error": str(e)}
-
 if __name__ == "__main__":
     import uvicorn
     logger.info("=" * 60)
-    logger.info("🐼 Starting Ocean Park Zoo Chatbot API")
+    logger.info("🐼 Starting Ocean Park Zoo Chatbot API with ESP32 Support")
     logger.info("=" * 60)
-    logger.info("Port: 9001 (different from museum's 8000)")
-    logger.info("WebSocket: ws://localhost:9001/ws")
-    logger.info("Web UI: http://localhost:9001")
-    logger.info("Health: http://localhost:9001/health")
-    logger.info("Database Test: http://localhost:9001/test-database")
+    logger.info("Port: 8000")
+    logger.info("Web Chat: ws://localhost:8000/ws")
+    logger.info("ESP32 Audio: ws://localhost:8000/ws/esp32/audio/{client_id}")
+    logger.info("Health: http://localhost:8000/health")
     logger.info("=" * 60)
     
-    # Create database if it doesn't exist
+    # Create database if needed
     if not os.path.exists("zoo.db"):
         logger.info("Creating zoo database...")
         from create_zoo_database import create_zoo_database
         create_zoo_database()
     
-    uvicorn.run(app, host="0.0.0.0", port=9001)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,4 +1,4 @@
-# zoo_api.py - FastAPI for Zoo chatbot with ESP32 support
+# zoo_api.py - FastAPI for Zoo chatbot with ESP32 support (Tailscale Funnel compatible)
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
@@ -51,10 +51,12 @@ async def root():
                 <h1>🐼 Ocean Park Zoo Chatbot</h1>
                 <h2>WebSocket Endpoints:</h2>
                 <ul>
-                    <li><strong>Web Chat:</strong> ws://localhost:8000/ws</li>
-                    <li><strong>ESP32 Audio:</strong> ws://localhost:8000/ws/esp32/audio/{client_id}</li>
-                    <li><strong>RPi Audio (legacy):</strong> ws://localhost:8000/ws/audio/{client_id}</li>
+                    <li><strong>Web Chat:</strong> /ws</li>
+                    <li><strong>ESP32 Audio:</strong> /ws/esp32/audio/{client_id}</li>
+                    <li><strong>RPi Audio (legacy):</strong> /ws/audio/{client_id}</li>
                 </ul>
+                <p><strong>Access via Tailscale Funnel:</strong> https://inx-fiona.tail4fb9a3.ts.net</p>
+                <p><em>WebSocket connections will use wss:// (secure) automatically when accessed via HTTPS</em></p>
             </body>
         </html>
         """)
@@ -167,9 +169,13 @@ async def health_check():
         "service": "Ocean Park Zoo Chatbot",
         "port": 8000,
         "endpoints": {
-            "web_chat": "ws://localhost:8000/ws",
-            "esp32_audio": "ws://localhost:8000/ws/esp32/audio/{client_id}",
-            "rpi_audio": "ws://localhost:8000/ws/audio/{client_id}"
+            "web_chat": "/ws",
+            "esp32_audio": "/ws/esp32/audio/{client_id}",
+            "rpi_audio": "/ws/audio/{client_id}"
+        },
+        "access": {
+            "tailscale_funnel": "https://inx-fiona.tail4fb9a3.ts.net",
+            "local": "http://localhost:8000"
         },
         "components": {
             "openai": True,
@@ -273,12 +279,14 @@ async def list_animals():
 if __name__ == "__main__":
     import uvicorn
     logger.info("=" * 60)
-    logger.info("🐼 Starting Ocean Park Zoo Chatbot API with ESP32 Support")
+    logger.info("🐼 Starting Ocean Park Zoo Chatbot API")
     logger.info("=" * 60)
     logger.info("Port: 8000")
-    logger.info("Web Chat: ws://localhost:8000/ws")
-    logger.info("ESP32 Audio: ws://localhost:8000/ws/esp32/audio/{client_id}")
-    logger.info("Health: http://localhost:8000/health")
+    logger.info("Local: http://localhost:8000")
+    logger.info("Tailscale Funnel: https://inx-fiona.tail4fb9a3.ts.net")
+    logger.info("Web Chat: /ws (wss:// via HTTPS)")
+    logger.info("ESP32 Audio: /ws/esp32/audio/{client_id}")
+    logger.info("Health: /health")
     logger.info("=" * 60)
     
     # Create database if needed

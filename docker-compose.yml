@@ -9,7 +9,7 @@ services:
       dockerfile: Dockerfile
     container_name: museum_chatbot
     ports:
-      - "8000:8000"
+      - "0.0.0.0:8000:8000"
     environment:
       - DATABASE_URL=postgresql://museum_user:museum_pass@postgres:5432/museum_db
       - REDIS_URL=redis://redis:6379
@@ -25,6 +25,7 @@ services:
     networks:
       - museum_network
     restart: unless-stopped
+    command: python zoo_api.py
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
