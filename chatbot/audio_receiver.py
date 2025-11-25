@@ -73,6 +73,8 @@ class AudioReceiver:
         self.processing_tasks[client_id] = asyncio.create_task(
             self._process_audio_queue(client_id, websocket)
         )
+
+        audio_reassembly = {}
         
         # Process registration
         if first_message.get("type") == "register":
@@ -91,22 +93,48 @@ class AudioReceiver:
                 
                 if data.get("type") == "audio_chunk":
                     audio_base64 = data.get("audio")
-                    audio_bytes = base64.b64decode(audio_base64)
-                    chunk_id = data.get("chunk_id", 0)
+
+                    logger.info(f"📦 Received chunk with audio field: {bool(audio_base64)}, length: {len(audio_base64) if audio_base64 else 0}")
+
+                    if not audio_base64:
+                        logger.warning(f"⚠️ Missing audio data in chunk")
+                        logger.warning(f"📋 Full message keys: {data.keys()}")
+                        continue
+
+                    try:
+                        audio_bytes = base64.b64decode(audio_base64)
+                        chunk_id = data.get("chunk_id", 0)
+
+                        if chunk_id == 0:
+                            # First chunk - reset buffer
+                            audio_reassembly[client_id] = []
+                            total_size = data.get("total_size", 0)
+                            if total_size:
+                                logger.info(f"📦 Starting audio reassembly: {total_size} bytes")
                     
-                    if chunk_id % 50 == 0 and chunk_id > 0:
-                        logger.debug(f"📥 Chunk {chunk_id}")
+                        audio_reassembly.setdefault(client_id, []).append(audio_bytes)
                     
-                    if client_id in self.audio_queues:
-                        self.audio_queues[client_id].append(audio_bytes)
+                        if chunk_id % 3 == 0:
+                            logger.debug(f"📥 Chunk {chunk_id}: {len(audio_bytes)} bytes")
+                    
+                    except Exception as e:
+                        logger.error(f"❌ Failed to decode audio chunk: {e}")
+                        continue
                 
                 elif data.get("type") == "audio_complete":
                     total_chunks = data.get('total_chunks', 0)
                     logger.info(f"🎤 Audio complete: {total_chunks} chunks")
                     
-                    if client_id in self.audio_queues:
-                        self.audio_queues[client_id].append("COMPLETE")
-                
+                    if client_id in audio_reassembly and audio_reassembly[client_id]:
+                        combined_audio = b''.join(audio_reassembly[client_id])
+                        logger.info(f"✅ Reassembled {len(combined_audio)} bytes from {len(audio_reassembly[client_id])} chunks")
+
+                        if client_id in self.audio_queues:
+                            self.audio_queues[client_id].append(combined_audio)
+                            self.audio_queues[client_id].append("COMPLETE")
+
+                        del audio_reassembly[client_id]
+
                 elif data.get("type") == "text_query":
                     text = data.get("text", "")
                     if text.strip():
@@ -152,7 +180,7 @@ class AudioReceiver:
                 item = self.audio_queues[client_id].popleft()
                 
                 if item == "COMPLETE":
-                    if len(audio_chunks) > 10:
+                    if len(audio_chunks) > 0:
                         logger.info(f"🎯 Processing {len(audio_chunks)} chunks")
                         
                         await websocket.send_json({
@@ -160,17 +188,23 @@ class AudioReceiver:
                             "message": "Processing speech..."
                         })
                         
-                        # Combine audio chunks
-                        combined_wav = self._combine_to_proper_wav(audio_chunks, client_id)
+                        if len(audio_chunks) == 1:
+                            # Single reassembled audio file
+                            combined_wav = audio_chunks[0]
+                            logger.info(f"📦 Using reassembled audio: {len(combined_wav)} bytes")
+                        else:
+                            # Multiple chunks need combining
+                            combined_wav = self._combine_to_proper_wav(audio_chunks, client_id)
+                            logger.info(f"🔧 Combined multiple chunks: {len(combined_wav)} bytes")
                         
                         if combined_wav:
-                            logger.info(f"Combined WAV: {len(combined_wav)} bytes")
+                            logger.info(f"🎙️ Starting STT on {len(combined_wav)} bytes...")
                             
                             # STT
                             text = await self._google_stt(combined_wav)
                             
                             if text and text.strip():
-                                logger.info(f"✅ STT: '{text}'")
+                                logger.info(f"✅ STT Result: '{text}'")
                                 
                                 await websocket.send_json({
                                     "type": "stt_result",
@@ -187,12 +221,20 @@ class AudioReceiver:
                                     "text": "",
                                     "error": "No speech detected"
                                 })
-                        
+                        else:
+                            logger.error("❌ Failed to get valid audio data")
+                    
                         audio_chunks = []
-                    continue
+                    
+
+                    else:
+                        logger.warning("⚠️ COMPLETE signal received but no audio chunks!")
+                    
+                        continue
                 
                 audio_chunks.append(item)
-                
+                logger.debug(f"📥 Added audio chunk {len(audio_chunks)}, size: {len(item)} bytes")
+            
             except asyncio.CancelledError:
                 logger.info(f"Processing cancelled for {client_id}")
                 break

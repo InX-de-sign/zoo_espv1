@@ -3,6 +3,8 @@
 
 from fastapi import FastAPI, File
 from fastapi.responses import HTMLResponse
+from fastapi import WebSocket, WebSocketDisconnect
+from image_receiver import ImageWebSocketReceiver
 from ultralytics import YOLO
 from PIL import Image
 import numpy as np
@@ -14,6 +16,7 @@ import os
 import cv2
 import logging
 from datetime import datetime
+from fastapi.middleware.cors import CORSMiddleware
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +32,16 @@ DETECTION_COOLDOWN = int(os.getenv("DETECTION_COOLDOWN", "5"))
 
 # FastAPI app
 app = FastAPI(title="Museum YOLO Inference Service")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+image_receiver = ImageWebSocketReceiver()
 
 # Global state
 yolo_model = None
@@ -143,6 +156,32 @@ async def fetch_camera_frame():
             video_capture = None
         return None
 
+async def run_inference_on_image(image: Image.Image, client_id: str):
+    """Run YOLO inference on received image"""
+    if yolo_model is None:
+        return []
+    
+    try:
+        results = yolo_model([image])
+        detections = parse_yolo_results(results)
+        
+        # Send to chatbot if detections found
+        for detection in detections:
+            label = detection['class_name']
+            confidence = detection['confidence']
+            
+            if should_send_detection(label):
+                logger.info(f"🎨 ESP32 Camera detected: {label} ({confidence:.2f})")
+                await send_detection_to_chatbot(label, confidence, client_id)
+        
+        return detections
+        
+    except Exception as e:
+        logger.error(f"Inference error: {e}")
+        return []
+
+# Set the inference callback
+image_receiver.inference_callback = run_inference_on_image
 
 async def process_http_stream():
     """Main inference loop - fetches frames from RTSP stream"""
@@ -280,6 +319,29 @@ async def shutdown_event():
 
 
 # ==================== API ENDPOINTS ====================
+@app.websocket("/vision/ws/esp32/camera/{client_id}")
+async def websocket_camera_endpoint(websocket: WebSocket, client_id: str):
+    """WebSocket endpoint for ESP32 camera clients"""
+    logger.info(f"📷 Camera WebSocket connection from: {client_id}")
+    logger.info(f"   Client: {websocket.client}")
+    logger.info(f"   Headers: {websocket.headers}")
+    
+    try:
+        await websocket.accept()  # ← Accept FIRST
+        logger.info(f"✅ Camera WebSocket accepted: {client_id}")
+        
+        first_message = await websocket.receive_json()
+        logger.info(f"📦 Received registration: {first_message}")
+        
+        # Handle the client
+        await image_receiver.handle_client_with_id(websocket, client_id, first_message)
+        
+    except WebSocketDisconnect:
+        logger.info(f"Camera client disconnected: {client_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 @app.get("/", response_class=HTMLResponse)
 async def root():

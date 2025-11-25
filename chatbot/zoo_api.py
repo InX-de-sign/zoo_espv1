@@ -185,6 +185,31 @@ async def health_check():
         }
     }
 
+@app.get("/test-tts")
+async def test_tts():
+    """Test if TTS actually works"""
+    try:
+        test_text = "Hello! This is a test."
+        logger.info(f"Testing TTS with text: '{test_text}'")
+        
+        audio = await voice_component.create_audio_response_async(test_text)
+        
+        result = {
+            "tts_available": voice_component.tts_available,
+            "gtts_available": voice_component.gtts_available,
+            "pygame_available": voice_component.pygame_available,
+            "audio_generated": audio is not None,
+            "audio_size": len(audio) if audio else 0,
+            "test_text": test_text
+        }
+        
+        logger.info(f"TTS Test Result: {result}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"TTS Test Error: {e}", exc_info=True)
+        return {"error": str(e)}
+
 @app.get("/test-audio")
 async def test_audio():
     """Test audio components"""

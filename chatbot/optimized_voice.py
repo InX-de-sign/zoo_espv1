@@ -43,6 +43,31 @@ except ImportError:
     HAS_PYDUB = False
     logger.warning("PyDub not available")
 
+tts_available = False
+gtts_available = HAS_GTTS
+pygame_available = False
+pydub_available = HAS_PYDUB
+
+if HAS_GTTS:
+    try:
+        pygame.mixer.init()
+        pygame_available = True
+        tts_available = True  # ✅ NOT self.tts_available
+        logger.info("Google TTS engine ready - FULL response audio enabled")
+        
+        # Test gTTS connectivity
+        logger.info("Testing gTTS connectivity...")
+        test_tts = gTTS(text="test", lang='en')
+        test_buffer = io.BytesIO()
+        test_tts.write_to_fp(test_buffer)
+        logger.info(f"✅ gTTS test successful: {test_buffer.tell()} bytes")
+        
+    except Exception as e:
+        logger.error(f"Pygame mixer or gTTS init failed: {e}")
+        logger.warning("TTS will work without pygame mixer (normal in Docker)")
+        pygame_available = False
+        tts_available = True 
+
 class OptimizedVoiceComponent:
     """Google TTS voice component - reliable online TTS with FULL response audio"""
     
@@ -57,17 +82,11 @@ class OptimizedVoiceComponent:
         # Thread pool for async operations
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         
-        # Initialize pygame mixer for audio playback
-        if HAS_GTTS:
-            try:
-                pygame.mixer.init()
-                self.tts_available = True
-                logger.info("Google TTS engine ready - FULL response audio enabled")
-            except Exception as e:
-                logger.error(f"Pygame mixer init failed: {e}")
-                self.tts_available = False
-        else:
-            self.tts_available = False
+        # Use the module-level variables set above
+        self.tts_available = tts_available
+        self.gtts_available = gtts_available
+        self.pygame_available = pygame_available
+        self.pydub_available = pydub_available
         
         if HAS_SPEECH_RECOGNITION:
             # Initialize speech recognition
@@ -80,6 +99,7 @@ class OptimizedVoiceComponent:
             self.recognizer = None
             logger.warning("Voice component - speech recognition disabled")
 
+            
     async def create_audio_response_async(self, text: str) -> Optional[bytes]:
         """Async Google TTS generation - FULL text, no truncation"""
         if not HAS_GTTS or not self.tts_available:

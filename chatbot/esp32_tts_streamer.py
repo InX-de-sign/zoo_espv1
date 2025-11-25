@@ -209,8 +209,7 @@ async def stream_openai_response_to_esp32(
     """
     streamer = ESP32TTSStreamer(voice_component)
     await streamer.stream_response_to_esp32(text, tts_websocket, client_id)
-
-
+                
 # Test function
 async def test_esp32_streaming():
     """Test ESP32 audio streaming"""

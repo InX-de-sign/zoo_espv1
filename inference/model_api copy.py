@@ -1,7 +1,8 @@
-# Museum Detection API with HTTP Camera Stream Integration
+# Museum Detection API with RTSP Camera Stream Integration
 # Run with: uvicorn model_api:app --host 0.0.0.0 --port 5000
 
 from fastapi import FastAPI, File
+from fastapi.responses import HTMLResponse
 from ultralytics import YOLO
 from PIL import Image
 import numpy as np
@@ -106,31 +107,7 @@ def should_send_detection(label: str) -> bool:
     return False
 
 
-# ==================== HTTP CAMERA STREAM ====================
-# async def fetch_camera_frame():
-#     """Fetch a single frame from HTTP/HTTPS camera endpoint"""
-#     try:
-#         async with httpx.AsyncClient(timeout=10.0) as client:
-#             response = await client.get(CAMERA_STREAM_URL)
-            
-#             if response.status_code == 200:
-#                 image_data = io.BytesIO(response.content)
-#                 pil_image = Image.open(image_data)
-#                 return pil_image
-#             else:
-#                 logger.error(f"Camera returned status {response.status_code}")
-#                 return None
-                
-#     except httpx.ConnectError as e:
-#         logger.warning(f"Cannot connect to camera at {CAMERA_STREAM_URL}: {e}")
-#         return None
-#     except httpx.TimeoutException:
-#         logger.warning(f"Camera request timeout")
-#         return None
-#     except Exception as e:
-#         logger.error(f"Error fetching frame: {e}")
-#         return None
-
+# ==================== RTSP CAMERA STREAM ====================
 async def fetch_camera_frame():
     """Fetch a frame from RTSP stream"""
     global video_capture
@@ -168,7 +145,7 @@ async def fetch_camera_frame():
 
 
 async def process_http_stream():
-    """Main inference loop - fetches frames via HTTP"""
+    """Main inference loop - fetches frames from RTSP stream"""
     global stream_detections, frame_count, inference_active
     
     inference_active = True
@@ -184,7 +161,6 @@ async def process_http_stream():
     test_frame = await fetch_camera_frame()
     if test_frame is None:
         logger.warning("⚠️ Cannot connect to camera (will retry in background)")
-        # Don't stop - keep trying
     else:
         logger.info("✅ Camera connected successfully")
     
@@ -296,90 +272,240 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Stop inference on shutdown"""
-    global inference_active
+    global inference_active, video_capture
     inference_active = False
+    if video_capture is not None:
+        video_capture.release()
     logger.info("Shutting down inference service")
 
 
 # ==================== API ENDPOINTS ====================
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 async def root():
     """Root endpoint with service information"""
-    detection_summary = ""
+    
+    # Build detection summary
     if stream_detections:
-        detection_summary = "<ul>"
-        for detection in stream_detections:
-            detection_summary += f"<li><strong>{detection['class_name']}</strong> - {detection['confidence']:.2%}</li>"
-        detection_summary += "</ul>"
+        detection_items = "".join([
+            f'<li><strong>{d["class_name"]}</strong> - {d["confidence"]:.1%} '
+            f'<span style="font-size:0.85em;color:#666;">({d["timestamp"].split("T")[1][:8]})</span></li>'
+            for d in stream_detections[:10]
+        ])
+        detection_summary = f"<ul>{detection_items}</ul>"
     else:
-        detection_summary = "<p><em>No artworks detected yet</em></p>"
+        detection_summary = '<p style="color:#999;font-style:italic;">No artworks detected yet</p>'
     
-    status_color = "#e8f5e9" if (yolo_model and inference_active) else "#fff3cd"
+    # Status indicators
+    model_status = "✅ Loaded" if yolo_model else "❌ Not Loaded"
+    stream_status = "✅ Active" if inference_active else "⏸️ Stopped"
+    status_color = "#d4edda" if (yolo_model and inference_active) else "#fff3cd"
     
-    return f"""
-    <html>
-        <head>
-            <title>Museum Artwork Detection</title>
-            <meta http-equiv="refresh" content="3">
-            <style>
-                body {{ font-family: 'Segoe UI', sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
-                .container {{ max-width: 900px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
-                h1 {{ color: #333; margin-top: 0; }}
-                .status {{ background: {status_color}; padding: 15px; border-radius: 8px; margin: 20px 0; }}
-                .status p {{ margin: 8px 0; }}
-                .endpoint {{ background: #f8f9fa; padding: 12px; margin: 8px 0; border-radius: 6px; border-left: 4px solid #007bff; }}
-                .endpoint code {{ background: #e9ecef; padding: 2px 6px; border-radius: 3px; font-family: monospace; }}
-                .detections {{ background: #f8f9fa; padding: 15px; border-radius: 8px; margin: 20px 0; }}
-                ul {{ margin: 10px 0; }}
-                li {{ margin: 5px 0; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>🎨 Museum Artwork Detection Service</h1>
-                
-                <div class="status">
-                    <p><strong>🤖 Model:</strong> {"✅ Loaded" if yolo_model else "❌ Not Loaded"}</p>
-                    <p><strong>📹 Stream:</strong> {"✅ Active" if inference_active else "⏸️ Stopped"}</p>
-                    <p><strong>📊 Frames Processed:</strong> {frame_count:,}</p>
-                    <p><strong>🎯 Current Detections:</strong> {len(stream_detections)}</p>
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Museum Artwork Detection</title>
+        <meta http-equiv="refresh" content="3">
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                padding: 20px;
+                min-height: 100vh;
+            }}
+            .container {{
+                max-width: 1000px;
+                margin: 0 auto;
+                background: white;
+                padding: 40px;
+                border-radius: 16px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            }}
+            h1 {{
+                color: #2d3748;
+                margin-bottom: 10px;
+                font-size: 2.5em;
+            }}
+            .subtitle {{
+                color: #718096;
+                margin-bottom: 30px;
+                font-size: 1.1em;
+            }}
+            .status-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 15px;
+                background: {status_color};
+                padding: 25px;
+                border-radius: 12px;
+                margin-bottom: 30px;
+                border-left: 5px solid #48bb78;
+            }}
+            .status-item {{
+                display: flex;
+                flex-direction: column;
+            }}
+            .status-label {{
+                font-size: 0.9em;
+                color: #4a5568;
+                margin-bottom: 5px;
+                font-weight: 600;
+            }}
+            .status-value {{
+                font-size: 1.3em;
+                color: #1a202c;
+                font-weight: bold;
+            }}
+            .section {{
+                background: #f7fafc;
+                padding: 25px;
+                border-radius: 12px;
+                margin-bottom: 25px;
+            }}
+            .section h2 {{
+                color: #2d3748;
+                margin-bottom: 15px;
+                font-size: 1.5em;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }}
+            .detections ul {{
+                list-style: none;
+                margin-top: 15px;
+            }}
+            .detections li {{
+                padding: 12px;
+                margin: 8px 0;
+                background: white;
+                border-radius: 8px;
+                border-left: 4px solid #667eea;
+                transition: transform 0.2s;
+            }}
+            .detections li:hover {{
+                transform: translateX(5px);
+            }}
+            .endpoints {{
+                display: grid;
+                gap: 10px;
+            }}
+            .endpoint {{
+                background: white;
+                padding: 15px;
+                border-radius: 8px;
+                border-left: 4px solid #3182ce;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }}
+            .endpoint code {{
+                background: #edf2f7;
+                padding: 6px 12px;
+                border-radius: 6px;
+                font-family: 'Courier New', monospace;
+                font-weight: bold;
+                color: #2d3748;
+            }}
+            .endpoint-desc {{
+                color: #718096;
+                font-size: 0.95em;
+            }}
+            .refresh-note {{
+                text-align: center;
+                color: #a0aec0;
+                font-size: 0.9em;
+                margin-top: 20px;
+                padding: 10px;
+                background: #edf2f7;
+                border-radius: 8px;
+            }}
+            .badge {{
+                display: inline-block;
+                padding: 4px 12px;
+                border-radius: 12px;
+                font-size: 0.85em;
+                font-weight: 600;
+            }}
+            .badge-success {{ background: #c6f6d5; color: #22543d; }}
+            .badge-warning {{ background: #feebc8; color: #7c2d12; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🎨 Museum Artwork Detection</h1>
+            <p class="subtitle">Real-time YOLO-based artwork detection system</p>
+            
+            <div class="status-grid">
+                <div class="status-item">
+                    <span class="status-label">🤖 Model</span>
+                    <span class="status-value">{model_status}</span>
                 </div>
-                
-                <div class="detections">
-                    <h3>Latest Detections:</h3>
-                    {detection_summary}
-                    <p style="font-size: 0.9em; color: #666; margin-top: 10px;">
-                        <em>Auto-refreshes every 3 seconds</em>
-                    </p>
+                <div class="status-item">
+                    <span class="status-label">📹 Stream</span>
+                    <span class="status-value">{stream_status}</span>
                 </div>
-                
-                <h3>📡 API Endpoints:</h3>
-                <div class="endpoint">
-                    <code>GET /health</code> - Health check
+                <div class="status-item">
+                    <span class="status-label">📊 Frames</span>
+                    <span class="status-value">{frame_count:,}</span>
                 </div>
-                <div class="endpoint">
-                    <code>GET /api/detections</code> - Get stream detections (JSON)
-                </div>
-                <div class="endpoint">
-                    <code>POST /predict/</code> - Upload image for detection
-                </div>
-                <div class="endpoint">
-                    <code>GET /result/</code> - Get results from uploaded image
-                </div>
-                <div class="endpoint">
-                    <code>GET /debug</code> - Debug information
-                </div>
-                <div class="endpoint">
-                    <code>POST /control/start</code> - Start inference
-                </div>
-                <div class="endpoint">
-                    <code>POST /control/stop</code> - Stop inference
+                <div class="status-item">
+                    <span class="status-label">🎯 Detections</span>
+                    <span class="status-value">{len(stream_detections)}</span>
                 </div>
             </div>
-        </body>
+            
+            <div class="section detections">
+                <h2>🔍 Latest Detections</h2>
+                {detection_summary}
+            </div>
+            
+            <div class="section">
+                <h2>📡 API Endpoints</h2>
+                <div class="endpoints">
+                    <div class="endpoint">
+                        <code>GET /health</code>
+                        <span class="endpoint-desc">Health check</span>
+                    </div>
+                    <div class="endpoint">
+                        <code>GET /api/detections</code>
+                        <span class="endpoint-desc">Stream detections (JSON)</span>
+                    </div>
+                    <div class="endpoint">
+                        <code>POST /predict/</code>
+                        <span class="endpoint-desc">Upload image</span>
+                    </div>
+                    <div class="endpoint">
+                        <code>GET /result/</code>
+                        <span class="endpoint-desc">Get upload results</span>
+                    </div>
+                    <div class="endpoint">
+                        <code>GET /debug</code>
+                        <span class="endpoint-desc">Debug info</span>
+                    </div>
+                    <div class="endpoint">
+                        <code>POST /control/start</code>
+                        <span class="endpoint-desc">Start inference</span>
+                    </div>
+                    <div class="endpoint">
+                        <code>POST /control/stop</code>
+                        <span class="endpoint-desc">Stop inference</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="refresh-note">
+                🔄 Page auto-refreshes every 3 seconds
+            </div>
+        </div>
+    </body>
     </html>
     """
+    
+    return html_content
 
 
 @app.get("/health")
@@ -471,18 +597,14 @@ async def stop_inference():
 async def debug_info():
     """Detailed debug information"""
     
-    # Test camera
-    camera_status = "testing..."
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.get(CAMERA_STREAM_URL)
-            camera_status = f"reachable (HTTP {response.status_code})"
-    except httpx.ConnectError:
-        camera_status = "unreachable (connection refused)"
-    except httpx.TimeoutException:
-        camera_status = "unreachable (timeout)"
-    except Exception as e:
-        camera_status = f"error ({type(e).__name__})"
+    # Test camera (for RTSP, we can't use httpx)
+    camera_status = "RTSP stream configured"
+    if video_capture is not None and video_capture.isOpened():
+        camera_status = "connected and active"
+    elif video_capture is not None:
+        camera_status = "initialized but not opened"
+    else:
+        camera_status = "not initialized"
     
     # Test chatbot
     chatbot_status = "testing..."

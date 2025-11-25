@@ -36,7 +36,7 @@ String wsPath = "/ws/esp32/audio/" + String(CLIENT_ID);
 #define I2S_SD_SPK 46
 
 // ==================== AUDIO SETTINGS ====================
-#define PLAYBACK_GAIN 8
+#define PLAYBACK_GAIN 16
 
 const int SAMPLE_RATE = 16000;
 const int BITS_PER_SAMPLE = 16;
@@ -51,6 +51,7 @@ HTTPClient http;
 int16_t *audio_buffer = NULL;
 uint8_t *playback_buffer = NULL;
 size_t playback_size = 0;
+size_t playback_buffer_capacity = 0;
 bool wav_ready = false;
 bool ws_connected = false;
 bool waiting_for_response = false;
@@ -154,12 +155,19 @@ void handleDownload() {
     return;
   }
   
-  uint8_t wav_file[44 + AUDIO_BUFFER_SIZE];
+  uint8_t* wav_file = (uint8_t*)heap_caps_malloc(44 + AUDIO_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+  if (!wav_file) {
+    server.send(500, "text/plain", "Memory allocation failed!");
+    return;
+  }
+
   buildWavHeader(wav_file, AUDIO_BUFFER_SIZE);
   memcpy(wav_file + 44, audio_buffer, AUDIO_BUFFER_SIZE);
   
   server.sendHeader("Content-Disposition", "attachment; filename=recording.wav");
   server.send_P(200, "audio/wav", (const char*)wav_file, 44 + AUDIO_BUFFER_SIZE);
+
+  free(wav_file);
 }
 
 // ==================== WEBSOCKET HANDLERS ====================
@@ -168,6 +176,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     case WStype_DISCONNECTED:
       Serial.printf("[%lu] ❌ WebSocket disconnected\n", millis());
       ws_connected = false;
+      waiting_for_response = false;
       break;
       
     case WStype_CONNECTED:
@@ -215,15 +224,48 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
           else if (msgType == "tts_start") {
             Serial.println("🔊 Audio incoming from server...");
             size_t expectedBytes = doc["total_bytes"];
-            if (playback_buffer) free(playback_buffer);
-            playback_buffer = (uint8_t*)heap_caps_malloc(expectedBytes + 1000, MALLOC_CAP_SPIRAM);
+            size_t available_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            Serial.printf("Expected: %d bytes, Available PSRAM: %d bytes\n", 
+                         expectedBytes, available_psram);
+
+            if (expectedBytes > available_psram - 50000) {
+              Serial.println("❌ Not enough PSRAM!");
+              webSocket.sendTXT("{\"type\":\"error\",\"message\":\"Insufficient memory\"}");
+              waiting_for_response = false;
+              return;
+            }
+
+            if (playback_buffer) {
+              free(playback_buffer);
+              playback_buffer = NULL;
+            }
+
+            size_t allocated_size = expectedBytes + 1024; 
+            playback_buffer = (uint8_t*)heap_caps_malloc(allocated_size, MALLOC_CAP_SPIRAM);
+            
+            if (!playback_buffer) {
+              Serial.println("❌ PSRAM allocation failed!");
+              webSocket.sendTXT("{\"type\":\"error\",\"message\":\"Allocation failed\"}");
+              waiting_for_response = false;
+              return;
+            }
+
+            playback_buffer_capacity = allocated_size;
             playback_size = 0;
             audio_received = false;
+            Serial.printf("✅ Buffer allocated: %d bytes\n", expectedBytes + 1024);
           }
+            
           else if (msgType == "tts_complete") {
             Serial.printf("✅ Audio received: %d bytes\n", playback_size);
-            audio_received = true;
-            waiting_for_response = false;
+            if (playback_buffer && playback_size > 44) {
+                Serial.println("📊 Audio ready - will play next loop");
+                audio_received = true;
+                waiting_for_response = false;
+            } else {
+                Serial.println("✅ Audio already played");
+                waiting_for_response = false;
+            }
           }
           else if (msgType == "error") {
             String errorMsg = doc["message"];
@@ -236,16 +278,36 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       
     case WStype_BIN:
       {
-        Serial.printf("📦 Audio chunk: %d bytes\n", length);
-        if (playback_buffer && playback_size + length < 200000) {
-          memcpy(playback_buffer + playback_size, payload, length);
-          playback_size += length;
+        if (!playback_buffer) {
+          Serial.println("❌ No buffer allocated!");
+          return;
         }
+        
+        if (playback_size + length > playback_buffer_capacity) {
+          Serial.printf("⚠️ Buffer full! Dropping %d bytes\n", length);
+          return;
+        }
+
+        memcpy(playback_buffer + playback_size, payload, length);
+        playback_size += length;
+
+        if (playback_size % 10240 == 0) {
+            Serial.printf("📦 Received: %d KB / %d KB\n", playback_size / 1024, playback_buffer_capacity / 1024);
+        }
+        
+        if (playback_size >= playback_buffer_capacity - 1024) {
+            Serial.println("✅ Buffer nearly full - marking as complete");
+            audio_received = true;
+            waiting_for_response = false;
+        }
+
+        yield();
       }
       break;
       
     case WStype_ERROR:
       Serial.println("❌ WebSocket ERROR!");
+      waiting_for_response = false;
       break;
   }
 }
@@ -283,35 +345,75 @@ void send_audio_to_server() {
   
   Serial.println("📤 Sending audio to Tailscale Funnel server...");
   
-  uint8_t wav_chunk[AUDIO_BUFFER_SIZE + 44];
+  uint8_t* wav_chunk = (uint8_t*)heap_caps_malloc(AUDIO_BUFFER_SIZE + 44, MALLOC_CAP_SPIRAM);
+  if (!wav_chunk) {
+    Serial.println("❌ Failed to allocate memory for WAV chunk!");
+    return;
+  }
+
   buildWavHeader(wav_chunk, AUDIO_BUFFER_SIZE);
   memcpy(wav_chunk + 44, audio_buffer, AUDIO_BUFFER_SIZE);
   
-  String encoded = base64::encode(wav_chunk, AUDIO_BUFFER_SIZE + 44);
+  size_t total_size = AUDIO_BUFFER_SIZE + 44;
   
-  DynamicJsonDocument doc(encoded.length() + 512);
-  doc["type"] = "audio_chunk";
-  doc["audio"] = encoded;
-  doc["chunk_id"] = 0;
-  doc["timestamp"] = millis();
-  doc["format"] = "audio/wav";
-  doc["sample_rate"] = SAMPLE_RATE;
-  doc["channels"] = 1;
-  
-  String msg;
-  serializeJson(doc, msg);
-  webSocket.sendTXT(msg);
-  
-  delay(100);
+  const size_t CHUNK_SIZE = 8192;  // 8KB chunks (safe for WebSocket)
+  size_t total_chunks = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+  Serial.printf("📦 Sending %d bytes in %d chunks\n", total_size, total_chunks);
+
+  for (size_t i = 0; i < total_chunks; i++) {
+    size_t offset = i * CHUNK_SIZE;
+    size_t chunk_len = min(CHUNK_SIZE, total_size - offset);
+    
+    // Encode this chunk
+    String encoded = base64::encode(wav_chunk + offset, chunk_len);
+    
+    // Create JSON for this chunk
+    DynamicJsonDocument doc(encoded.length() + 256);
+    doc["type"] = "audio_chunk";
+    doc["audio"] = encoded;
+    doc["chunk_id"] = i;
+    doc["total_chunks"] = total_chunks;
+    doc["total_size"] = total_size;
+
+    if (i == 0) {
+      // First chunk includes metadata
+      doc["timestamp"] = millis();
+      doc["format"] = "audio/wav";
+      doc["sample_rate"] = SAMPLE_RATE;
+      doc["channels"] = 1;
+    }
+    
+    String msg;
+    serializeJson(doc, msg);
+    
+    // Send chunk
+    webSocket.sendTXT(msg);
+    
+    // Progress indicator
+    if (i % 5 == 0 || i == total_chunks - 1) {
+      Serial.printf("📤 Sent chunk %d/%d (%.0f%%)\n", 
+                    i + 1, total_chunks, 
+                    ((i + 1) * 100.0) / total_chunks);
+    }
+
+    delay(10);
+    yield();
+  }
+
+  delay(50);
   DynamicJsonDocument completeDoc(256);
   completeDoc["type"] = "audio_complete";
-  completeDoc["total_chunks"] = 1;
+  completeDoc["total_chunks"] = total_chunks;
   completeDoc["timestamp"] = millis();
   completeDoc["client_id"] = deviceId;
   
   String completeMsg;
   serializeJson(completeDoc, completeMsg);
   webSocket.sendTXT(completeMsg);
+  
+  // Clean up
+  free(wav_chunk);
   
   Serial.println("✅ Audio sent via Tailscale Funnel!");
   waiting_for_response = true;
@@ -326,16 +428,43 @@ void play_response_audio() {
   Serial.println("🔊 Playing response...");
   
   digitalWrite(I2S_SD_SPK, HIGH);
-  delay(20);
+  delay(50);
   
   size_t audio_data_size = playback_size - 44;
-  size_t written;
-  i2s_write(I2S_NUM_1, playback_buffer + 44, audio_data_size, &written, portMAX_DELAY);
+  size_t bytes_written = 0;
+  size_t chunk_size = 4096;  
+
+  while (bytes_written < audio_data_size) {
+    size_t to_write = min(chunk_size, audio_data_size - bytes_written);
+    size_t written = 0;
+    
+    i2s_write(I2S_NUM_1, 
+              playback_buffer + 44 + bytes_written, 
+              to_write, 
+              &written, 
+              portMAX_DELAY);
+    
+    bytes_written += written;
+
+    yield();
+    
+    if (bytes_written % 20480 == 0) {
+      Serial.printf("🎵 Playing: %d%%\n", (bytes_written * 100) / audio_data_size);
+    }
+  }
+  delay(100);
   
   digitalWrite(I2S_SD_SPK, LOW);
   
   Serial.println("✅ Playback complete!");
+  
   audio_received = false;
+  if (playback_buffer) {
+    free(playback_buffer);
+    playback_buffer = NULL;
+  }
+  playback_size = 0;
+  playback_buffer_capacity = 0;
 }
 
 // ==================== SETUP ====================
@@ -426,7 +555,7 @@ void setup() {
   // WebSocket (SSL for Tailscale Funnel)
   Serial.printf("🔌 Connecting to wss://%s:%d%s\n", SERVER_HOST, SERVER_PORT, wsPath.c_str());
   webSocket.beginSSL(SERVER_HOST, SERVER_PORT, wsPath.c_str());
-  webSocket.setInsecure();  // Skip SSL cert verification (for Tailscale)
+  // webSocket.setInsecure();  // Skip SSL cert verification (for Tailscale)
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
   
@@ -456,12 +585,45 @@ void loop() {
     delay(50);
     
     if (!waiting_for_response) {
+      // normal once record flow
       Serial.println("\n🎬 Button pressed - Starting workflow...\n");
+      
+      size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+      Serial.printf("Free PSRAM: %d bytes\n", free_psram);
+      
+      if (free_psram < 200000) {
+        Serial.println("⚠️ Low memory! Skipping...");
+        return;
+      }
+
       record_audio();
       send_audio_to_server();
       Serial.println("⏳ Waiting for server response...");
+
     } else {
+      // interruptions
       Serial.println("⚠️ Still waiting for previous response...");
+
+      // Cancel previous audio
+      waiting_for_response = false;
+      audio_received = false;
+      
+      // Free old playback buffer
+      if (playback_buffer) {
+        free(playback_buffer);
+        playback_buffer = NULL;
+      }
+      playback_size = 0;
+      playback_buffer_capacity = 0;
+
+      Serial.println("🎬 Starting new recording...\n");
+      
+      size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+      Serial.printf("Free PSRAM: %d bytes\n", free_psram);
+      
+      record_audio();
+      send_audio_to_server();
+      Serial.println("⏳ Waiting for server response...");
     }
   }
   
@@ -471,5 +633,6 @@ void loop() {
     play_response_audio();
   }
   
-  delay(10);
+  yield();
+  delay(5);
 }
