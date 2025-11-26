@@ -1,8 +1,8 @@
 # Museum Detection API with RTSP Camera Stream Integration
 # Run with: uvicorn model_api:app --host 0.0.0.0 --port 5000
 
-from fastapi import FastAPI, File
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, File, UploadFile, Header
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi import WebSocket, WebSocketDisconnect
 from image_receiver import ImageWebSocketReceiver
 from ultralytics import YOLO
@@ -17,6 +17,8 @@ import cv2
 import logging
 from datetime import datetime
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
+from io import BytesIO
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -120,41 +122,41 @@ def should_send_detection(label: str) -> bool:
     return False
 
 
-# ==================== RTSP CAMERA STREAM ====================
-async def fetch_camera_frame():
-    """Fetch a frame from RTSP stream"""
-    global video_capture
+# # ==================== RTSP CAMERA STREAM ====================
+# async def fetch_camera_frame():
+#     """Fetch a frame from RTSP stream"""
+#     global video_capture
     
-    try:
-        # Initialize video capture if needed
-        if video_capture is None or not video_capture.isOpened():
-            logger.info(f"Opening video stream: {CAMERA_STREAM_URL}")
-            video_capture = cv2.VideoCapture(CAMERA_STREAM_URL)
+#     try:
+#         # Initialize video capture if needed
+#         if video_capture is None or not video_capture.isOpened():
+#             logger.info(f"Opening video stream: {CAMERA_STREAM_URL}")
+#             video_capture = cv2.VideoCapture(CAMERA_STREAM_URL)
             
-            if not video_capture.isOpened():
-                logger.error("Failed to open video stream")
-                return None
+#             if not video_capture.isOpened():
+#                 logger.error("Failed to open video stream")
+#                 return None
         
-        # Read frame
-        ret, frame = video_capture.read()
+#         # Read frame
+#         ret, frame = video_capture.read()
         
-        if not ret or frame is None:
-            logger.warning("Failed to read frame")
-            video_capture.release()
-            video_capture = None
-            return None
+#         if not ret or frame is None:
+#             logger.warning("Failed to read frame")
+#             video_capture.release()
+#             video_capture = None
+#             return None
         
-        # Convert BGR to RGB and to PIL Image
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(frame_rgb)
-        return pil_image
+#         # Convert BGR to RGB and to PIL Image
+#         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+#         pil_image = Image.fromarray(frame_rgb)
+#         return pil_image
         
-    except Exception as e:
-        logger.error(f"Error fetching frame: {e}")
-        if video_capture is not None:
-            video_capture.release()
-            video_capture = None
-        return None
+#     except Exception as e:
+#         logger.error(f"Error fetching frame: {e}")
+#         if video_capture is not None:
+#             video_capture.release()
+#             video_capture = None
+#         return None
 
 async def run_inference_on_image(image: Image.Image, client_id: str):
     """Run YOLO inference on received image"""
@@ -183,79 +185,79 @@ async def run_inference_on_image(image: Image.Image, client_id: str):
 # Set the inference callback
 image_receiver.inference_callback = run_inference_on_image
 
-async def process_http_stream():
-    """Main inference loop - fetches frames from RTSP stream"""
-    global stream_detections, frame_count, inference_active
+# async def process_http_stream():
+#     """Main inference loop - fetches frames from RTSP stream"""
+#     global stream_detections, frame_count, inference_active
     
-    inference_active = True
-    last_inference_time = 0
-    retry_count = 0
-    max_retries = 3
+#     inference_active = True
+#     last_inference_time = 0
+#     retry_count = 0
+#     max_retries = 3
     
-    logger.info(f"🎥 Camera stream configured: {CAMERA_STREAM_URL}")
-    logger.info(f"📡 Chatbot endpoint: {CHATBOT_URL}")
+#     logger.info(f"🎥 Camera stream configured: {CAMERA_STREAM_URL}")
+#     logger.info(f"📡 Chatbot endpoint: {CHATBOT_URL}")
     
-    # Test initial connection
-    logger.info("Testing camera connection...")
-    test_frame = await fetch_camera_frame()
-    if test_frame is None:
-        logger.warning("⚠️ Cannot connect to camera (will retry in background)")
-    else:
-        logger.info("✅ Camera connected successfully")
+#     # Test initial connection
+#     logger.info("Testing camera connection...")
+#     test_frame = await fetch_camera_frame()
+#     if test_frame is None:
+#         logger.warning("⚠️ Cannot connect to camera (will retry in background)")
+#     else:
+#         logger.info("✅ Camera connected successfully")
     
-    try:
-        while inference_active:
-            current_time = time.time()
+#     try:
+#         while inference_active:
+#             current_time = time.time()
             
-            if current_time - last_inference_time >= INFERENCE_INTERVAL:
+#             if current_time - last_inference_time >= INFERENCE_INTERVAL:
                 
-                frame = await fetch_camera_frame()
+#                 frame = await fetch_camera_frame()
                 
-                if frame is None:
-                    retry_count += 1
-                    if retry_count <= max_retries:
-                        logger.debug(f"Waiting for camera... (attempt {retry_count})")
-                    await asyncio.sleep(2)
-                    last_inference_time = current_time
-                    continue
+#                 if frame is None:
+#                     retry_count += 1
+#                     if retry_count <= max_retries:
+#                         logger.debug(f"Waiting for camera... (attempt {retry_count})")
+#                     await asyncio.sleep(2)
+#                     last_inference_time = current_time
+#                     continue
                 
-                retry_count = 0
+#                 retry_count = 0
                 
-                if yolo_model:
-                    try:
-                        results = yolo_model([frame])
-                        detections = parse_yolo_results(results)
-                        stream_detections = detections
+#                 if yolo_model:
+#                     try:
+#                         results = yolo_model([frame])
+#                         detections = parse_yolo_results(results)
+#                         stream_detections = detections
                         
-                        for detection in detections:
-                            label = detection['class_name']
-                            confidence = detection['confidence']
+#                         for detection in detections:
+#                             label = detection['class_name']
+#                             confidence = detection['confidence']
                             
-                            if should_send_detection(label):
-                                logger.info(f"🎨 Detected: {label} (confidence: {confidence:.2f})")
-                                await send_detection_to_chatbot(label, confidence)
+#                             if should_send_detection(label):
+#                                 logger.info(f"🎨 Detected: {label} (confidence: {confidence:.2f})")
+#                                 await send_detection_to_chatbot(label, confidence)
                         
-                        if detections:
-                            logger.debug(f"Frame {frame_count}: {len(detections)} detections")
+#                         if detections:
+#                             logger.debug(f"Frame {frame_count}: {len(detections)} detections")
                             
-                    except Exception as e:
-                        logger.error(f"Detection error: {e}")
+#                     except Exception as e:
+#                         logger.error(f"Detection error: {e}")
                 
-                last_inference_time = current_time
-                frame_count += 1
+#                 last_inference_time = current_time
+#                 frame_count += 1
                 
-                if frame_count % 50 == 0:
-                    logger.info(f"📊 Processed {frame_count} frames")
+#                 if frame_count % 50 == 0:
+#                     logger.info(f"📊 Processed {frame_count} frames")
             
-            await asyncio.sleep(0.1)
+#             await asyncio.sleep(0.1)
             
-    except Exception as e:
-        logger.error(f"Error in inference loop: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-    finally:
-        inference_active = False
-        logger.info("🛑 Inference loop stopped")
+#     except Exception as e:
+#         logger.error(f"Error in inference loop: {e}")
+#         import traceback
+#         logger.error(traceback.format_exc())
+#     finally:
+#         inference_active = False
+#         logger.info("🛑 Inference loop stopped")
 
 
 def parse_yolo_results(results):
@@ -289,7 +291,7 @@ async def startup_event():
     logger.info(f"Configuration:")
     logger.info(f"  - Model: {YOLO_MODEL_PATH}")
     logger.info(f"  - Chatbot: {CHATBOT_URL}")
-    logger.info(f"  - Camera: {CAMERA_STREAM_URL}")
+    # logger.info(f"  - Camera: {CAMERA_STREAM_URL}")
     logger.info(f"  - Inference Interval: {INFERENCE_INTERVAL}s")
     logger.info(f"  - Detection Cooldown: {DETECTION_COOLDOWN}s")
     
@@ -302,7 +304,7 @@ async def startup_event():
         except Exception as e:
             logger.warning(f"⚠️ Chatbot not reachable yet: {e}")
         
-        asyncio.create_task(process_http_stream())
+        # asyncio.create_task(process_http_stream())
         logger.info("✅ Inference service started")
     else:
         logger.error("❌ Failed to start - model not loaded")
@@ -594,7 +596,93 @@ async def get_stream_detections():
         'inference_active': inference_active
     }
 
+# ==================== SHARED UPLOAD LOGIC ====================
+async def handle_image_upload(
+    file: bytes,
+    x_client_id: str,
+    x_position: str,
+    x_photo_number: str,
+    x_timestamp: str
+):
+    """Shared upload logic for both endpoint paths"""
+    try:
+        client_id = x_client_id or "unknown_camera"
+        position = x_position or "unknown"
+        photo_num = x_photo_number or "0"
+        
+        logger.info(f"📷 Received image from {client_id}: position={position}, photo={photo_num}, size={len(file)} bytes")
+        
+        # Convert to PIL Image
+        image = Image.open(BytesIO(file))
+        logger.info(f"📸 Image decoded: {image.size[0]}x{image.size[1]} {image.mode}")
+        
+        # Run YOLO inference
+        if yolo_model is not None:
+            results = yolo_model([image])
+            detections = parse_yolo_results(results)
+            
+            logger.info(f"✅ Inference complete: {len(detections)} detections")
+            
+            # Send detections to chatbot
+            for detection in detections:
+                label = detection['class_name']
+                confidence = detection['confidence']
+                
+                if should_send_detection(label):
+                    logger.info(f"🎨 ESP32 Camera detected: {label} ({confidence:.2f})")
+                    await send_detection_to_chatbot(label, confidence, client_id)
+            
+            return JSONResponse({
+                "status": "success",
+                "client_id": client_id,
+                "position": position,
+                "photo_number": photo_num,
+                "detections": detections,
+                "image_size": f"{image.size[0]}x{image.size[1]}"
+            })
+        else:
+            logger.warning("⚠️ YOLO model not initialized")
+            return JSONResponse({
+                "status": "accepted",
+                "message": "Image received but inference not available",
+                "client_id": client_id,
+                "position": position
+            })
+            
+    except Exception as e:
+        logger.error(f"❌ Error processing upload: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
 
+
+@app.post("/vision/upload")
+async def upload_image_with_prefix(
+    file: bytes = File(...),
+    x_client_id: str = Header(None),
+    x_position: str = Header(None),
+    x_photo_number: str = Header(None),
+    x_timestamp: str = Header(None)
+):
+    """HTTP endpoint: /vision/upload (full path preserved)"""
+    logger.info("📍 Request at /vision/upload")
+    return await handle_image_upload(file, x_client_id, x_position, x_photo_number, x_timestamp)
+
+
+@app.post("/upload")
+async def upload_image_no_prefix(
+    file: bytes = File(...),
+    x_client_id: str = Header(None),
+    x_position: str = Header(None),
+    x_photo_number: str = Header(None),
+    x_timestamp: str = Header(None)
+):
+    """HTTP endpoint: /upload (if Tailscale strips /vision)"""
+    logger.info("📍 Request at /upload")
+    return await handle_image_upload(file, x_client_id, x_position, x_photo_number, x_timestamp)
 @app.post("/predict/")
 async def predict_uploaded_image(image: bytes = File(...)):
     """Upload an image for prediction"""

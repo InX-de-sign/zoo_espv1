@@ -4,6 +4,8 @@ from memory_tracker import HybridMemoryTracker
 import asyncio
 import os
 import logging
+import json
+import time
 from typing import Dict, Any
 
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +42,10 @@ class HybridZooAI:
         try:
             logger.info(f"Processing: '{message_text[:50]}...' for user: {user_id}")
             
+            if user_id not in self.memory.conversations:
+                logger.info(f"🔄 Restoring previous session for {user_id}")
+                self._restore_session(user_id)
+
             message_lower = message_text.lower()
 
             # Detect animal being asked about
@@ -83,6 +89,55 @@ class HybridZooAI:
         except Exception as e:
             logger.error(f"Processing error: {e}")
             return "I'm having some technical difficulties, but I'm still here to help with your animal questions!"
+
+    def _restore_session(self, user_id: str):
+        """Restore previous conversation session from database"""
+        try:
+            import sqlite3
+            conn = sqlite3.connect(self.memory.memory_db_path)
+            cursor = conn.cursor()
+            
+            # Get last 5 interactions
+            cursor.execute('''
+                SELECT message, response, intent, entities, timestamp
+                FROM conversation_history
+                WHERE user_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 5
+            ''', (user_id,))
+            
+            rows = cursor.fetchall()
+            conn.close()
+            
+            if rows:
+                # Initialize conversation in memory
+                self.memory.conversations[user_id] = {
+                    "history": [],
+                    "current_topic": None,
+                    "interests": set(),
+                    "mentioned_animals": set(),
+                    "session_start": time.time()
+                }
+                
+                # Restore history (reverse order - oldest first)
+                for message, response, intent, entities_json, timestamp in reversed(rows):
+                    entities = json.loads(entities_json) if entities_json else []
+                    self.memory.conversations[user_id]["history"].append({
+                        "timestamp": timestamp,
+                        "message": message,
+                        "response": response,
+                        "intent": intent,
+                        "entities": entities,
+                        "source": "restored"
+                    })
+                    
+                    # Restore interests
+                    self.memory.update_user_interests(user_id, message, entities)
+                
+                logger.info(f"✅ Restored {len(rows)} previous interactions for {user_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to restore session: {e}")
 
     def _determine_query_type(self, message_text, context):
         """Determine query type for zoo context"""

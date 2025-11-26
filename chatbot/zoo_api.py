@@ -2,6 +2,7 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
+from datetime import datetime 
 import asyncio
 import json
 import os
@@ -81,7 +82,6 @@ async def websocket_endpoint(websocket: WebSocket):
             
             if not message:
                 continue
-            
             logger.info(f"Query from {client_id}: {message}")
             
             await websocket.send_json({
@@ -134,6 +134,10 @@ async def esp32_audio_endpoint(websocket: WebSocket, client_id: str):
     await websocket.accept()
     logger.info(f"🎤 ESP32 audio client connected: {client_id}")
     
+    keepalive_task = asyncio.create_task(
+        send_keepalive_pings(websocket, client_id)
+    )
+
     try:
         # Wait for registration
         first_message = await websocket.receive_json()
@@ -145,6 +149,33 @@ async def esp32_audio_endpoint(websocket: WebSocket, client_id: str):
         logger.info(f"🔌 ESP32 disconnected: {client_id}")
     except Exception as e:
         logger.error(f"❌ ESP32 error: {e}", exc_info=True)
+    finally:
+        # ✅ Cancel keepalive task
+        keepalive_task.cancel()
+        try:
+            await keepalive_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def send_keepalive_pings(websocket: WebSocket, client_id: str):
+    """Send periodic pings to keep connection alive"""
+    try:
+        while True:
+            await asyncio.sleep(20)  # Ping every 20 seconds
+            try:
+                await websocket.send_json({
+                    "type": "keepalive",
+                    "timestamp": datetime.now().isoformat()
+                })
+                logger.debug(f"📡 Sent keepalive to {client_id}")
+            except Exception as e:
+                logger.debug(f"Keepalive failed for {client_id}: {e}")
+                break
+    except asyncio.CancelledError:
+        logger.debug(f"Keepalive task cancelled for {client_id}")
+
+
 
 @app.websocket("/ws/audio/{client_id}")
 async def rpi_audio_endpoint(websocket: WebSocket, client_id: str):
@@ -160,6 +191,7 @@ async def rpi_audio_endpoint(websocket: WebSocket, client_id: str):
         logger.info(f"🔌 RPi disconnected: {client_id}")
     except Exception as e:
         logger.error(f"❌ RPi error: {e}", exc_info=True)
+        
 
 @app.get("/health")
 async def health_check():

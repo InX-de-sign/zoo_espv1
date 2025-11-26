@@ -52,23 +52,23 @@ class EnhancedRAGWithOpenAI:
                 STYLE: 
                     Talk like Ms. Frizzle from Magic School Bus - excited about discovery, sharing "cool facts" naturally, making observations together.
                 CRITICAL RULES:
-                    - MAXIMUM 3 SHORT sentences (spoken naturally)
+                    - EXACTLY ONE sentence ONLY (15-20 words maximum)
                     - NEVER use emojis or Unicode symbols
-                    - Share 1-2 fun facts
+                    - Share fun facts
                     - NEVER end with questions (just statements!)
                     - Connect to Ocean Park location when possible
                 GOOD EXAMPLES: 
-                    "Oh wow, red pandas! These guys are actually more like raccoons than giant pandas. They're up at the Amazing Asian Animals area, and they LOVE climbing trees!"
-                    "The pandas here are absolute superstars! They can munch through 40 kilograms of bamboo every single day - that's like eating 160 bowls of noodles! Head to the Giant Panda Adventure to see them in action!" """,
+                    "Red pandas are actually more like raccoons than giant pandas."
+                    "The pandas can munch through 40 kilograms of bamboo every single day!" """,
             
             'general_animal_knowledge': """
                 Converse as an enthusiastic zoo guide for kids aged 7-10 at Ocean Park, Hong Kong.
                 STYLE: 
                     Talk like Ms. Frizzle from Magic School Bus - excited about discovery, sharing "cool facts" naturally, making observations together.
                 CRITICAL RULES:
-                    - MAXIMUM 3 SHORT sentences (spoken naturally)
+                    - EXACTLY ONE sentence ONLY (15-20 words maximum)
                     - NEVER use emojis or Unicode symbols
-                    - Share 1-2 fun facts
+                    - Share fun facts
                     - NEVER end with questions (just statements!)
                     - Share wonder and observations (NOT questions)
                     - Be specific: use numbers, comparisons, fun details
@@ -85,14 +85,14 @@ class EnhancedRAGWithOpenAI:
                 STYLE: 
                     Ms. Frizzle from  the Magic School Bus explaining something fascinating - clear, exciting, relatable comparisons.
                 CRITICAL RULES:
-                    - MAXIMUM 3 SHORT sentences (spoken naturally)
+                    - EXACTLY ONE sentence ONLY (15-20 words maximum)
                     - NEVER use emojis or Unicode symbols
                     - Share 1-2 fun facts
                     - NEVER end with questions (just statements!)
                     - Connect to Ocean Park whenever you can
                 GOOD EXAMPLES:
-                    "Arctic foxes have the warmest fur in the animal kingdom! Their fluffy coat is so thick it keeps them cozy even when it's -70°C - colder than your freezer at home! Watch how they curl up into little balls to stay warm!"
-                    "Penguins are birds that traded flying in the sky for 'flying' underwater! Their wings became super strong flippers that push them through water at 35 km/h - faster than you can run!"
+                    "Arctic foxes have the warmest fur in the animal kingdom!"
+                    "Penguins are birds that traded flying in the sky for 'flying' underwater!"
                 BAD EXAMPLES:
                     "Why do you think foxes have thick fur? What helps them survive?" NO
                     "Arctic foxes have adaptations for cold weather including thick fur." NO""",
@@ -333,6 +333,21 @@ class EnhancedRAGWithOpenAI:
                 prompt_parts.append("")
         except Exception as e:
             logger.debug(f"Detected animal error: {e}")
+
+        try:
+            # Add conversation history
+            conversation_history = context.get('conversation_history', []) if context else []
+            if conversation_history and len(conversation_history) > 0:
+                prompt_parts.append("RECENT CONVERSATION:")
+                for i, prev_msg in enumerate(conversation_history[-3:], 1):  # Last 3 messages
+                    if isinstance(prev_msg, str) and prev_msg.strip():
+                        prompt_parts.append(f"  {i}. Visitor asked: {prev_msg}")
+                prompt_parts.append("")
+                prompt_parts.append("IMPORTANT: Use this conversation history to understand context and pronouns like 'they', 'them', 'those animals'.")
+                prompt_parts.append("")
+        except Exception as e:
+            logger.debug(f"Conversation history error: {e}")
+    
         
         # Add the actual user query
         if query and isinstance(query, str):

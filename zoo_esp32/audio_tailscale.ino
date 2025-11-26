@@ -217,6 +217,10 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             String text = doc["text"].as<String>();
             Serial.println("🔊 Transcription: " + text);
           }
+          else if (msgType == "keepalive") {
+            // Silent acknowledgment - don't spam logs
+            // Connection is kept alive automatically
+          }
           else if (msgType == "ai_response_text") {
             String text = doc["text"].as<String>();
             Serial.println("💬 AI Response: " + text);
@@ -313,6 +317,29 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 }
 
 // ==================== AUDIO FUNCTIONS ====================
+void play_test_tone() {
+  Serial.println("🔊 Playing test tone...");
+  
+  digitalWrite(I2S_SD_SPK, HIGH);
+  delay(50);
+  
+  // Generate 1kHz sine wave
+  int16_t sample_buffer[480];
+  for (int i = 0; i < 480; i++) {
+    float angle = (2.0 * PI * 1000.0 * i) / 16000.0;
+    sample_buffer[i] = (int16_t)(sin(angle) * 10000);  // Loud!
+  }
+  
+  // Play for 2 seconds
+  for (int i = 0; i < 100; i++) {
+    size_t written;
+    i2s_write(I2S_NUM_1, sample_buffer, sizeof(sample_buffer), &written, portMAX_DELAY);
+  }
+  
+  digitalWrite(I2S_SD_SPK, LOW);
+  Serial.println("✅ Test tone complete");
+}
+
 void record_audio() {
   Serial.println("🎤 Recording...");
   
@@ -510,6 +537,9 @@ void setup() {
   Serial.println("✅ Microphone initialized");
   
   // I2S Speaker
+  //testing: should hear beep sound
+  play_test_tone();
+
   i2s_config_t tx = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = SAMPLE_RATE,
@@ -529,6 +559,7 @@ void setup() {
   i2s_driver_install(I2S_NUM_1, &tx, 0, NULL);
   i2s_set_pin(I2S_NUM_1, &pin_tx);
   Serial.println("✅ Speaker initialized");
+  
   
   // WiFi
   WiFi.begin(ssid, password);
@@ -578,6 +609,13 @@ void loop() {
   server.handleClient();
   webSocket.loop();
   
+  static unsigned long lastPing = 0;
+  if (ws_connected && (millis() - lastPing > 15000)) {
+    webSocket.sendTXT("{\"type\":\"ping\"}");
+    lastPing = millis();
+    Serial.println("📡 Keepalive ping sent");
+  }
+
   static bool lastButtonState = HIGH;
   bool currentButtonState = digitalRead(BUTTON_PIN);
   
