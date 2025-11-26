@@ -431,7 +431,8 @@ void capture() {
 
   Serial.println("📍 Position 2: right-down");
   head.moveH(90);
-  delay(HOLD_TIME);
+  delay(HOLD_TIME);  
+  
   takePhoto(2, "right-down");
 
   Serial.println("📍 Position 3: right-up");

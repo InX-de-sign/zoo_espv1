@@ -4,7 +4,7 @@ import os
 import sqlite3
 import logging
 import re
-from typing import Dict, Any, Optional, AsyncGenerator
+from typing import Dict, Any, Optional
 import asyncio
 from config import load_azure_openai_config
 
@@ -26,16 +26,12 @@ class EnhancedRAGWithOpenAI:
             api_version=self.config.api_version,
             azure_endpoint=self.config.azure_endpoint
         )
-
-        from streaming_openai import StreamingOpenAI
-        self.streaming_openai = StreamingOpenAI()
         
         self.openai_available = True
         logger.info("Azure OpenAI client initialized")
 
         # Database path
         self.db_path = db_path or self._find_database()
-
 
         # Animal name patterns for better matching
         self.animal_patterns = {
@@ -102,15 +98,7 @@ class EnhancedRAGWithOpenAI:
                     "Arctic foxes have adaptations for cold weather including thick fur." NO""",
             
             
-            'park_info': """
-                You are a helpful zoo guide of the Hong Kong Ocean Park. 
-                Give clear, friendly directions. Use simple language.
-                CRITICAL RULES:
-                    - EXACTLY ONE sentence ONLY (15-20 words maximum)
-                    - NEVER use emojis or Unicode symbols
-                STYLE: 
-                    Ms. Frizzle from  the Magic School Bus explaining something fascinating - clear, exciting, relatable comparisons.
-                """,
+            'park_info': """You are a helpful zoo guide of the Hong Kong Ocean Park. Give clear, friendly directions. Keep it to 1-2 sentences. Use landmarks.""",
         }
 
         # Test OpenAI connection
@@ -243,15 +231,6 @@ class EnhancedRAGWithOpenAI:
                 response_parts.append(f"You can visit them at {location}!")
             
             return " ".join(response_parts)
-    
-    async def stream_query_with_openai(self, query: str, context: Dict[str, Any], user_id: str) -> AsyncGenerator[str, None]:
-        """Stream OpenAI response for real-time TTS"""
-        try:
-            async for chunk in self.streaming_openai.stream_response(query, context):
-                yield chunk
-        except Exception as e:
-            logger.error(f"Streaming error: {e}")
-            yield "Let me tell you something amazing!"
 
     async def process_query_with_openai(self, query: str, context: Dict[str, Any], user_id: str) -> str:
         """Process query using OpenAI with full context"""

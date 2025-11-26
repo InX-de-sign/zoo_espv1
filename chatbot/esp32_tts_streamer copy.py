@@ -18,40 +18,59 @@ class ESP32TTSStreamer:
     
     async def stream_response_to_esp32(self, text: str, websocket: WebSocket, client_id: str):
         """
-        Stream audio in real-time as it's being generated
+        Complete workflow: Text → Google TTS → Convert to ESP32 format → Stream
+        
+        ESP32 Audio Requirements:
+        - Format: WAV
+        - Sample Rate: 16kHz (ESP32-friendly)
+        - Channels: Mono
+        - Bit Depth: 16-bit
+        - Streaming: 4KB chunks
         """
         try:
             logger.info(f"🔊 Generating TTS for ESP32 {client_id}: '{text[:50]}...'")
             
-            # Step 1: Start TTS generation
+            # Step 1: Generate Google TTS (returns MP3)
             mp3_audio = await self.voice_component.create_audio_response_async(text)
             
             if not mp3_audio or len(mp3_audio) < 100:
                 logger.error("❌ TTS generation failed")
+                await websocket.send_json({
+                    "type": "tts_error",
+                    "message": "TTS generation failed"
+                })
                 return
             
             logger.info(f"✅ Generated MP3: {len(mp3_audio)} bytes")
             
-            # Step 2: Convert to WAV
-            audio = AudioSegment.from_mp3(io.BytesIO(mp3_audio))
-            audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-            audio = audio.speedup(playback_speed=1.2)
+            # Step 2: Convert MP3 to ESP32-compatible WAV
+            wav_audio = await self._convert_to_esp32_format(mp3_audio)
             
-            wav_buffer = io.BytesIO()
-            audio.export(wav_buffer, format="wav")
-            wav_buffer.seek(0)
-            wav_bytes = wav_buffer.getvalue()
+            if not wav_audio:
+                logger.error("❌ Audio conversion failed")
+                await websocket.send_json({
+                    "type": "tts_error",
+                    "message": "Audio conversion failed"
+                })
+                return
             
-            # Step 3: Stream immediately (don't wait)
-            asyncio.create_task(
-                self._stream_wav_to_esp32(wav_bytes, websocket, client_id)
-            )
+            logger.info(f"✅ Converted to WAV: {len(wav_audio)} bytes")
             
-            logger.info(f"✅ Streaming started for {client_id}")
+            # Step 3: Stream to ESP32
+            await self._stream_wav_to_esp32(wav_audio, websocket, client_id)
+            
+            logger.info(f"✅ Streaming complete for {client_id}")
             
         except Exception as e:
             logger.error(f"❌ TTS streaming error: {e}", exc_info=True)
-
+            try:
+                await websocket.send_json({
+                    "type": "tts_error",
+                    "message": str(e)
+                })
+            except:
+                pass
+    
     async def _convert_to_esp32_format(self, mp3_bytes: bytes) -> Optional[bytes]:
         """
         Convert MP3 to ESP32-compatible WAV
