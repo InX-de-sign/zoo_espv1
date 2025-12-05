@@ -38,6 +38,31 @@ class HybridZooAI:
                 
         logger.info("Hybrid Zoo AI ready!")
     
+    def _normalize_animal_name(self, animal_name: str) -> str:
+        """
+        Normalize animal names from CV detection to match database format
+        CV sends: "red-panda", "arctic-fox", "harbor-seal"
+        Database has: "red panda", "arctic fox", "harbor seal"
+        """
+        if not animal_name:
+            return None
+        
+        # Replace hyphens with spaces
+        normalized = animal_name.replace('-', ' ')
+        
+        # Handle common variations
+        name_mappings = {
+            'red panda': 'red panda',
+            'arctic fox': 'arctic fox',
+            'harbor seal': 'seal',  # Database might have "harbour seal" or just "seal"
+            'harbour seal': 'seal',
+            'sea lion': 'sea lion',
+            'giant panda': 'panda'
+        }
+        
+        return name_mappings.get(normalized.lower(), normalized)
+
+
     async def process_message(self, message_text, user_id="default_user", cv_detected_animal=None):
         try:
             logger.info(f"Processing: '{message_text[:50]}...' for user: {user_id}")
@@ -46,27 +71,47 @@ class HybridZooAI:
                 logger.info(f"🔄 Restoring previous session for {user_id}")
                 self._restore_session(user_id)
 
+            # 🎯 NORMALIZE CV detection
+            normalized_cv_animal = None
+            if cv_detected_animal:
+                normalized_cv_animal = self._normalize_animal_name(cv_detected_animal)
+                logger.info(f"🎯 CV DETECTED: {normalized_cv_animal} (from {cv_detected_animal})")
+                
+                # Update current topic (but don't clear history)
+                if user_id in self.memory.conversations:
+                    self.memory.conversations[user_id]["current_topic"] = normalized_cv_animal
+                    # Add to mentioned animals set
+                    if "mentioned_animals" not in self.memory.conversations[user_id]:
+                        self.memory.conversations[user_id]["mentioned_animals"] = set()
+                    self.memory.conversations[user_id]["mentioned_animals"].add(normalized_cv_animal)
+
             message_lower = message_text.lower()
 
-            # Detect animal being asked about
-            if cv_detected_animal:
-                logger.info(f"CV detection active: {cv_detected_animal}")
-                detected_animal = cv_detected_animal
-            else:
-                detected_animal = self._detect_animal(message_text)
+            # Use CV detection first, fallback to text detection
+            detected_animal = normalized_cv_animal or self._detect_animal(message_text)
 
             conversation_context = self.memory.get_conversation_context(user_id)
             personalized_context = self.memory.get_personalized_context(user_id)
             
             query_type = self._determine_query_type(message_text, conversation_context)
 
+            # 🎯 BUILD CONTEXT WITH CV PRIORITY
             full_context = {
                 'local_database': self._get_relevant_local_context(message_text, detected_animal),  
                 'user_context': personalized_context,
                 'detected_animal': detected_animal,
+                'cv_detected_animal': normalized_cv_animal,  # 🆕 ADD THIS
                 'query_type': query_type,
                 'conversation_history': conversation_context.get('recent_messages', [])
             }
+
+            # 🎯 ADD STRONG CV CONTEXT INSTRUCTION
+            if normalized_cv_animal:
+                full_context['cv_instruction'] = f"""
+    IMPORTANT: The user is currently viewing a {normalized_cv_animal} through their camera.
+    Unless they explicitly ask about a different animal, assume all questions refer to the {normalized_cv_animal}.
+    Give priority to information about the {normalized_cv_animal} in your response.
+    """
 
             response = await self.enhanced_rag.process_query_with_openai(
                 query=message_text,
@@ -79,18 +124,20 @@ class HybridZooAI:
                 message=message_text,
                 response=response,
                 intent=self._extract_intent(message_text),
-                entities=self._extract_entities(message_text),
+                entities=self._extract_entities(message_text, detected_animal),
                 source="zoo_rag_openai"
             )
 
             logger.info(f"Response generated: '{response[:50]}...'")             
             return response
-                
+                        
         except Exception as e:
             logger.error(f"Processing error: {e}")
             return "I'm having some technical difficulties, but I'm still here to help with your animal questions!"
 
-    async def stream_message(self, message_text, user_id="default_user"):
+
+    # 3. Update stream_message - SAME LOGIC
+    async def stream_message(self, message_text, user_id="default_user", cv_detected_animal=None):
         """
         Stream OpenAI response word-by-word for real-time TTS
         """
@@ -100,18 +147,40 @@ class HybridZooAI:
             if user_id not in self.memory.conversations:
                 self._restore_session(user_id)
 
-            detected_animal = self._detect_animal(message_text)
+            # 🎯 NORMALIZE CV detection
+            normalized_cv_animal = None
+            if cv_detected_animal:
+                normalized_cv_animal = self._normalize_animal_name(cv_detected_animal)
+                logger.info(f"🎯 CV DETECTED FOR STREAMING: {normalized_cv_animal}")
+                
+                if user_id in self.memory.conversations:
+                    self.memory.conversations[user_id]["current_topic"] = normalized_cv_animal
+                    if "mentioned_animals" not in self.memory.conversations[user_id]:
+                        self.memory.conversations[user_id]["mentioned_animals"] = set()
+                    self.memory.conversations[user_id]["mentioned_animals"].add(normalized_cv_animal)
+
+            detected_animal = normalized_cv_animal or self._detect_animal(message_text)
             conversation_context = self.memory.get_conversation_context(user_id)
             personalized_context = self.memory.get_personalized_context(user_id)
             query_type = self._determine_query_type(message_text, conversation_context)
 
+            # 🎯 BUILD CONTEXT WITH CV PRIORITY
             full_context = {
                 'local_database': self._get_relevant_local_context(message_text, detected_animal),  
                 'user_context': personalized_context,
                 'detected_animal': detected_animal,
+                'cv_detected_animal': normalized_cv_animal,  # 🆕 ADD THIS
                 'query_type': query_type,
                 'conversation_history': conversation_context.get('recent_messages', [])
             }
+            
+            # 🎯 ADD STRONG CV CONTEXT INSTRUCTION
+            if normalized_cv_animal:
+                full_context['cv_instruction'] = f"""
+    IMPORTANT: The user is currently viewing a {normalized_cv_animal} through their camera.
+    Unless they explicitly ask about a different animal, assume all questions refer to the {normalized_cv_animal}.
+    Give priority to information about the {normalized_cv_animal} in your response.
+    """
 
             # Stream from OpenAI
             full_response = ""
@@ -129,14 +198,102 @@ class HybridZooAI:
                 message=message_text,
                 response=full_response,
                 intent=self._extract_intent(message_text),
-                entities=self._extract_entities(message_text),
+                entities=self._extract_entities(message_text, detected_animal),
                 source="zoo_rag_openai_stream"
             )
-                
+                    
         except Exception as e:
             logger.error(f"Streaming error: {e}")
             yield "I'm having some technical difficulties, but I'm still here to help!"
+
+
+    # 4. Update _extract_entities to include detected animal
+    def _extract_entities(self, message_text, detected_animal=None):
+        """Simple entity extraction for memory tracking"""
+        entities = []
+        
+        # 🎯 PRIORITIZE CV DETECTED ANIMAL
+        if detected_animal:
+            entities.append({"entity": "animal", "value": detected_animal, "source": "cv_detection"})
+        else:
+            # Fallback to text detection
+            animal = self._detect_animal(message_text)
+            if animal:
+                entities.append({"entity": "animal", "value": animal, "source": "text_detection"})
+        
+        return entities
+
+
+    # 5. Update _get_relevant_local_context to use normalized name
+    def _get_relevant_local_context(self, message_text, detected_animal=None):
+        """Get relevant content from zoo database"""
+        if not self.db_path or not os.path.exists(self.db_path):
+            return "No local database available."
+        
+        try:
+            import sqlite3
             
+            # 🎯 NORMALIZE the animal name
+            animal_name = self._normalize_animal_name(detected_animal) if detected_animal else self._detect_animal(message_text)
+            
+            if animal_name:
+                logger.info(f"🔍 Searching database for: {animal_name}")
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                # Search by common name with flexible matching
+                cursor.execute('''
+                    SELECT common_name, scientific_name, distribution_range, habitat,
+                        characteristics, body_measurements, diet, behavior,
+                        location_at_park, stories, conservation_status, threats, conservation_actions
+                    FROM animals
+                    WHERE LOWER(common_name) LIKE ? OR LOWER(common_name) LIKE ?
+                ''', (f'%{animal_name}%', f'%{animal_name.replace(" ", "%")}%'))
+                
+                result = cursor.fetchone()
+                conn.close()
+                
+                if result:
+                    logger.info(f"✅ Found database entry for: {animal_name}")
+                    common_name, sci_name, distribution, habitat, chars, measurements, diet, behavior, location, stories, status, threats, actions = result
+                    
+                    return f"""OCEAN PARK ANIMAL INFORMATION:
+    Common Name: {common_name or 'Unknown'}
+    Scientific Name: {sci_name or 'Unknown'}
+    Distribution: {distribution or 'Unknown'}
+    Habitat: {habitat or 'Unknown'}
+    Physical Characteristics: {chars or 'No information available'}
+    Body Measurements: {measurements or 'Not specified'}
+    Diet: {diet or 'Not specified'}
+    Behavior: {behavior or 'Not specified'}
+    Location at Park: {location or 'Check park map'}
+    Conservation Status: {status or 'Not specified'}
+    Threats: {threats or 'Not specified'}
+    Conservation Actions: {actions or 'Not specified'}
+    Stories: {stories or 'No stories available'}"""
+                else:
+                    logger.warning(f"⚠️ No database entry found for: {animal_name}")
+            
+            # Fallback: general collection info
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT common_name, scientific_name, location_at_park FROM animals LIMIT 3")
+            all_animals = cursor.fetchall()
+            conn.close()
+            
+            if all_animals:
+                context_parts = ["OCEAN PARK ANIMAL COLLECTION:"]
+                for name, sci_name, location in all_animals:
+                    context_parts.append(f"- {name} ({sci_name}) at {location}")
+                
+                return "\n".join(context_parts)
+            
+            return "Animal collection information unavailable."
+                
+        except Exception as e:
+            logger.error(f"Database context error: {e}")
+            return "Local database context unavailable due to error."             
+
     def _restore_session(self, user_id: str):
         """Restore previous conversation session from database"""
         try:
@@ -239,70 +396,6 @@ class HybridZooAI:
         
         return None
 
-    def _get_relevant_local_context(self, message_text, detected_animal=None):
-        """Get relevant content from zoo database"""
-        if not self.db_path or not os.path.exists(self.db_path):
-            return "No local database available."
-        
-        try:
-            import sqlite3
-            
-            animal_name = detected_animal or self._detect_animal(message_text)
-            
-            if animal_name:
-                logger.info(f"Searching database for: {animal_name}")
-                conn = sqlite3.connect(self.db_path)
-                cursor = conn.cursor()
-                
-                # Search by common name
-                cursor.execute('''
-                    SELECT common_name, scientific_name, distribution_range, habitat,
-                           characteristics, body_measurements, diet, behavior,
-                           location_at_park, stories, conservation_status, threats, conservation_actions
-                    FROM animals
-                    WHERE LOWER(common_name) LIKE ?
-                ''', (f'%{animal_name}%',))
-                
-                result = cursor.fetchone()
-                conn.close()
-                
-                if result:
-                    common_name, sci_name, distribution, habitat, chars, measurements, diet, behavior, location, stories, status, threats, actions = result
-                    
-                    return f"""OCEAN PARK ANIMAL INFORMATION:
-Common Name: {common_name or 'Unknown'}
-Scientific Name: {sci_name or 'Unknown'}
-Distribution: {distribution or 'Unknown'}
-Habitat: {habitat or 'Unknown'}
-Physical Characteristics: {chars or 'No information available'}
-Body Measurements: {measurements or 'Not specified'}
-Diet: {diet or 'Not specified'}
-Behavior: {behavior or 'Not specified'}
-Location at Park: {location or 'Check park map'}
-Conservation Status: {status or 'Not specified'}
-Threats: {threats or 'Not specified'}
-Conservation Actions: {actions or 'Not specified'}
-Stories: {stories or 'No stories available'}"""
-            
-            # Fallback: general collection info
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT common_name, scientific_name, location_at_park FROM animals LIMIT 3")
-            all_animals = cursor.fetchall()
-            conn.close()
-            
-            if all_animals:
-                context_parts = ["OCEAN PARK ANIMAL COLLECTION:"]
-                for name, sci_name, location in all_animals:
-                    context_parts.append(f"- {name} ({sci_name}) at {location}")
-                
-                return "\n".join(context_parts)
-            
-            return "Animal collection information unavailable."
-                
-        except Exception as e:
-            logger.error(f"Database context error: {e}")
-            return "Local database context unavailable due to error."
 
     def _extract_intent(self, message_text):
         """Simple intent extraction for memory tracking"""
@@ -323,16 +416,6 @@ Stories: {stories or 'No stories available'}"""
         else:
             return "general_query"
 
-    def _extract_entities(self, message_text):
-        """Simple entity extraction for memory tracking"""
-        entities = []
-        
-        # Detect animals
-        animal = self._detect_animal(message_text)
-        if animal:
-            entities.append({"entity": "animal", "value": animal})
-        
-        return entities
 
     def get_user_insights(self, user_id):
         """Get insights about user for personalization"""

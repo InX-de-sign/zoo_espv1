@@ -9,6 +9,7 @@ from typing import Optional, Dict
 from fastapi import WebSocket
 from collections import deque
 from esp32_tts_streamer import ESP32TTSStreamer
+from pydub import AudioSegment
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -68,11 +69,22 @@ class AudioReceiver:
         """Handle audio from ESP32/RPi client"""
         logger.info(f"🎤 Audio receiver started for client: {client_id}")
         
+        # ✅ Clean up old task if it exists (in case of reconnect)
+        if client_id in self.processing_tasks:
+            logger.info(f"🧹 Cancelling old processing task for {client_id}")
+            self.processing_tasks[client_id].cancel()
+            try:
+                await self.processing_tasks[client_id]
+            except asyncio.CancelledError:
+                pass
+        
         # Initialize queue and task
         self.audio_queues[client_id] = deque(maxlen=300)
         self.processing_tasks[client_id] = asyncio.create_task(
             self._process_audio_queue(client_id, websocket)
         )
+        
+        logger.info(f"✅ Processing task started for {client_id}")
 
         audio_reassembly = {}
         
@@ -167,6 +179,8 @@ class AudioReceiver:
         """Process audio chunks → STT → OpenAI → TTS → Stream to ESP32"""
         audio_chunks = []
         
+        logger.info(f"🔄 Audio processing task STARTED for {client_id}")  # ← ADD THIS
+    
         while True:
             try:
                 if client_id not in self.audio_queues:
@@ -178,7 +192,8 @@ class AudioReceiver:
                     continue
                 
                 item = self.audio_queues[client_id].popleft()
-                
+                logger.debug(f"📥 Dequeued item: {type(item)} (size: {len(item) if isinstance(item, bytes) else 'N/A'})")
+
                 if item == "COMPLETE":
                     if len(audio_chunks) > 0:
                         logger.info(f"🎯 Processing {len(audio_chunks)} chunks")
@@ -244,57 +259,163 @@ class AudioReceiver:
     
     async def _process_with_openai_and_stream(self, text: str, client_id: str, websocket: WebSocket):
         """
-        NEW: Complete workflow for ESP32
-        1. Process with OpenAI
-        2. Generate Google TTS
-        3. Convert to ESP32 format
-        4. Stream audio back
+        SEQUENTIAL: Generate and stream one phrase at a time with smart phrase splitting
         """
         if not self.assistant:
             logger.warning("⚠️ Assistant not configured")
-            await websocket.send_json({
-                "type": "error",
-                "message": "AI assistant not configured"
-            })
             return
         
         try:
-            logger.info(f"🤖 Processing with OpenAI: '{text}'")
+            logger.info(f"🤖 Processing with OpenAI (SEQUENTIAL STREAMING): '{text}'")
             
-            # Notify processing
             await websocket.send_json({
                 "type": "openai_processing",
                 "message": "Getting AI response..."
             })
+
+            phrases = []
+            word_buffer = ""
+            MIN_WORDS = 5
+            MAX_WORDS = 12  # ✅ REDUCED from 20 to 12 for shorter audio chunks
             
-            # Get OpenAI response
-            response = await self.assistant.process_message(text, client_id)
+            # Step 1: Collect all phrases from OpenAI with SMART splitting
+            async for text_chunk in self.assistant.stream_message(text, client_id):
+                word_buffer += text_chunk
+                current_words = len(word_buffer.split())
+                
+                # Check for natural sentence endings
+                has_ending = any(punct in word_buffer for punct in ['.', '!', '?', ','])  # ✅ Added comma
+                
+                # Split logic - MORE AGGRESSIVE
+                if has_ending and current_words >= MIN_WORDS:
+                    # Natural ending with enough words
+                    phrase = word_buffer.strip()
+                    if phrase:
+                        phrases.append(phrase)
+                        logger.info(f"📝 Collected phrase {len(phrases)}: {phrase[:50]}...")
+                    word_buffer = ""
+                    
+                elif current_words >= MAX_WORDS:
+                    # Too long - find last punctuation or space
+                    last_punct = max(
+                        word_buffer.rfind(','),
+                        word_buffer.rfind(' ')
+                    )
+                    
+                    if last_punct > len(word_buffer) // 2:  # Only split if past halfway
+                        phrase = word_buffer[:last_punct].strip()
+                        if phrase:
+                            phrases.append(phrase)
+                            logger.info(f"📝 Collected phrase {len(phrases)}: {phrase[:50]}...")
+                        word_buffer = word_buffer[last_punct:].strip()
+                    else:
+                        # Force split if can't find good break point
+                        phrase = word_buffer.strip()
+                        if phrase:
+                            phrases.append(phrase)
+                            logger.info(f"📝 Collected phrase {len(phrases)}: {phrase[:50]}...")
+                        word_buffer = ""
             
-            logger.info(f"✅ Got response: '{response[:100]}...'")
+            # Handle remaining text
+            if word_buffer.strip():
+                phrases.append(word_buffer.strip())
+                logger.info(f"📝 Collected final phrase {len(phrases)}: {word_buffer.strip()[:50]}...")
             
-            # Send text response (optional, for debugging)
-            await websocket.send_json({
-                "type": "ai_response_text",
-                "text": response
-            })
+            logger.info(f"✅ Collected {len(phrases)} phrases")
             
-            # Stream TTS audio to ESP32
-            logger.info(f"🔊 Streaming audio response to ESP32...")
-            await self.esp32_streamer.stream_response_to_esp32(
-                text=response,
-                websocket=websocket,
-                client_id=client_id
-            )
+            # Filter out very short phrases
+            phrases = [p for p in phrases if len(p) > 2]
+            logger.info(f"✅ After filtering: {len(phrases)} phrases")
             
-            logger.info("✅ Complete workflow finished")
-            
+            # Step 2: Generate and stream SEQUENTIALLY
+            for idx, phrase in enumerate(phrases):
+                logger.info(f"🎵 [{idx+1}/{len(phrases)}] Generating TTS: {phrase[:50]}...")
+                
+                try:
+                    mp3_audio = await self.voice_component.create_audio_response_async(phrase)
+                    
+                    if not mp3_audio or len(mp3_audio) < 100:
+                        logger.error(f"❌ [{idx+1}/{len(phrases)}] TTS generation failed")
+                        continue
+                    
+                    logger.info(f"✅ [{idx+1}/{len(phrases)}] Generated {len(mp3_audio)} bytes MP3")
+                    
+                    # Convert to WAV
+                    audio = AudioSegment.from_mp3(io.BytesIO(mp3_audio))
+                    audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+                    audio = audio.speedup(playback_speed=1.1)
+                    
+                    wav_buffer = io.BytesIO()
+                    audio.export(wav_buffer, format="wav")
+                    wav_buffer.seek(0)
+                    wav_bytes = wav_buffer.getvalue()
+                    
+                    logger.info(f"✅ [{idx+1}/{len(phrases)}] Converted to {len(wav_bytes)} bytes WAV")
+                    
+                    # ✅ ADD SIZE CHECK - Skip if too large for buffer
+                    if len(wav_bytes) > 250000:  # 250KB safety margin
+                        logger.warning(f"⚠️ [{idx+1}/{len(phrases)}] Audio too large ({len(wav_bytes)} bytes), splitting further")
+                        # Split the phrase in half and process separately
+                        words = phrase.split()
+                        mid = len(words) // 2
+                        part1 = ' '.join(words[:mid])
+                        part2 = ' '.join(words[mid:])
+                        
+                        # Process first half
+                        mp3_1 = await self.voice_component.create_audio_response_async(part1)
+                        if mp3_1:
+                            audio_1 = AudioSegment.from_mp3(io.BytesIO(mp3_1))
+                            audio_1 = audio_1.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+                            audio_1 = audio_1.speedup(playback_speed=1.1)
+                            wav_1 = io.BytesIO()
+                            audio_1.export(wav_1, format="wav")
+                            await self.esp32_streamer._stream_wav_to_esp32(wav_1.getvalue(), websocket, client_id)
+                        
+                        # Process second half
+                        mp3_2 = await self.voice_component.create_audio_response_async(part2)
+                        if mp3_2:
+                            audio_2 = AudioSegment.from_mp3(io.BytesIO(mp3_2))
+                            audio_2 = audio_2.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+                            audio_2 = audio_2.speedup(playback_speed=1.1)
+                            wav_2 = io.BytesIO()
+                            audio_2.export(wav_2, format="wav")
+                            await self.esp32_streamer._stream_wav_to_esp32(wav_2.getvalue(), websocket, client_id)
+                        
+                        logger.info(f"✅ [{idx+1}/{len(phrases)}] Split and streamed")
+                        continue
+                    
+                    # Normal streaming
+                    await self.esp32_streamer._stream_wav_to_esp32(wav_bytes, websocket, client_id)
+                    logger.info(f"✅ [{idx+1}/{len(phrases)}] Streaming complete")
+                    
+                except Exception as e:
+                    logger.error(f"❌ [{idx+1}/{len(phrases)}] Error: {e}", exc_info=True)
+
+            logger.info(f"✅ All {len(phrases)} phrases streamed sequentially")
+                        
         except Exception as e:
-            logger.error(f"❌ OpenAI processing error: {e}", exc_info=True)
-            await websocket.send_json({
-                "type": "error",
-                "message": f"AI processing failed: {str(e)}"
-            })
-    
+            logger.error(f"❌ OpenAI streaming error: {e}", exc_info=True)
+                
+        
+    def _extract_complete_sentences(self, text: str) -> list:
+        """Extract complete sentences from text buffer"""
+        import re
+        # Split on sentence endings
+        sentences = re.split(r'([.!?\n]+)', text)
+        complete = []
+        
+        for i in range(0, len(sentences)-1, 2):
+            if i+1 < len(sentences):
+                complete.append(sentences[i] + sentences[i+1])
+        
+        return complete
+
+    def _get_incomplete_sentence(self, text: str) -> str:
+        """Get the incomplete sentence from buffer"""
+        import re
+        parts = re.split(r'[.!?\n]+', text)
+        return parts[-1] if parts else ""
+        
     def _combine_to_proper_wav(self, chunks: list, client_id: str) -> Optional[bytes]:
         """Combine WAV chunks into single WAV file"""
         try:

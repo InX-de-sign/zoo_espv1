@@ -1,0 +1,14 @@
+{
+  "classes": [
+    "{0: 'arctic-fox'",
+    "1: 'capybara'",
+    "2: 'harbor-seal'",
+    "3: 'panda'",
+    "4: 'parrot'",
+    "5: 'penguin'",
+    "6: 'red-panda'",
+    "7: 'sloth'}"
+  ],
+  "num_classes": 8,
+  "model_path": "best_animal_v3.onnx"
+}

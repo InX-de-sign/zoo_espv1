@@ -1,4 +1,4 @@
-# Orchestrating all services together
+# Orchestrating all services together - Zoo Animal Detection System
 # version: '3.8'
 
 services:
@@ -7,11 +7,11 @@ services:
     build: 
       context: ./chatbot
       dockerfile: Dockerfile
-    container_name: museum_chatbot
+    container_name: zoo_chatbot
     ports:
       - "0.0.0.0:8000:8000"
     environment:
-      - DATABASE_URL=postgresql://museum_user:museum_pass@postgres:5432/museum_db
+      - DATABASE_URL=postgresql://zoo_user:zoo_pass@postgres:5432/zoo_db
       - REDIS_URL=redis://redis:6379
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - CV_SERVICE_URL=http://yolo_inference:5000
@@ -23,7 +23,7 @@ services:
       - ./chatbot:/app
       - chatbot_logs:/app/logs
     networks:
-      - museum_network
+      - zoo_network
     restart: unless-stopped
     command: python zoo_api.py
     healthcheck:
@@ -33,7 +33,7 @@ services:
       retries: 3
       start_period: 40s
 
-  # YOLO Inference Service - Receives frames from Raspberry Pi webcam_client
+  # YOLO Inference Service - Animal Detection
   yolo_inference:
     build:
       context: ./inference
@@ -42,12 +42,13 @@ services:
     ports:
       - "5000:5000"
     environment:
-      - MODEL_PATH=/app/models/best.onnx
-      - CHATBOT_URL=http://museum_chatbot:8000
-      # REMOVED: CAMERA_URL - we receive frames via /predict/ instead
+      # ✅ UPDATED: Point to new animal detection model
+      - MODEL_PATH=/app/models/best_animal_v3.onnx
+      - CHATBOT_URL=http://zoo_chatbot:8000
+      # ESP32 camera endpoints available at /vision/upload and /vision/ws/esp32/camera/{client_id}
       - INFERENCE_INTERVAL=0.5
       - DETECTION_COOLDOWN=5
-      # Detection parameters (matching your working local setup)
+      # Detection parameters for animal detection
       - IMGSZ=640
       - CONF_THRESHOLD=0.75
       - DEVICE=cpu
@@ -58,7 +59,7 @@ services:
     depends_on:
       - chatbot
     networks:
-      - museum_network
+      - zoo_network
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
@@ -70,46 +71,46 @@ services:
   # PostgreSQL Database
   postgres:
     image: postgres:13
-    container_name: museum_postgres
+    container_name: zoo_postgres
     environment:
-      POSTGRES_DB: museum_db
-      POSTGRES_USER: museum_user
-      POSTGRES_PASSWORD: museum_pass
+      POSTGRES_DB: zoo_db
+      POSTGRES_USER: zoo_user
+      POSTGRES_PASSWORD: zoo_pass
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5432:5432"
     networks:
-      - museum_network
+      - zoo_network
     restart: unless-stopped
 
   # Redis for caching
   redis:
     image: redis:6-alpine
-    container_name: museum_redis
+    container_name: zoo_redis
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
     networks:
-      - museum_network
+      - zoo_network
     restart: unless-stopped
     command: redis-server --appendonly yes
 
   # Vector Database (for embeddings)
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: museum_vectordb
+    container_name: zoo_vectordb
     ports:
       - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     networks:
-      - museum_network
+      - zoo_network
     restart: unless-stopped
 
-    # MediaMTX - RTSP Streaming Server
+  # MediaMTX - RTSP Streaming Server (optional - for RTSP cameras)
   mediamtx:
     image: bluenviron/mediamtx:latest
     container_name: mediamtx
@@ -120,7 +121,7 @@ services:
     volumes:
       - ./mediamtx.yml:/mediamtx.yml
     networks:
-      - museum_network
+      - zoo_network
     restart: unless-stopped
 
 # Define volumes
@@ -132,5 +133,5 @@ volumes:
 
 # Define network
 networks:
-  museum_network:
+  zoo_network:
     driver: bridge

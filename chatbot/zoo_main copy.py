@@ -90,6 +90,53 @@ class HybridZooAI:
             logger.error(f"Processing error: {e}")
             return "I'm having some technical difficulties, but I'm still here to help with your animal questions!"
 
+    async def stream_message(self, message_text, user_id="default_user"):
+        """
+        Stream OpenAI response word-by-word for real-time TTS
+        """
+        try:
+            logger.info(f"Streaming: '{message_text[:50]}...' for user: {user_id}")
+            
+            if user_id not in self.memory.conversations:
+                self._restore_session(user_id)
+
+            detected_animal = self._detect_animal(message_text)
+            conversation_context = self.memory.get_conversation_context(user_id)
+            personalized_context = self.memory.get_personalized_context(user_id)
+            query_type = self._determine_query_type(message_text, conversation_context)
+
+            full_context = {
+                'local_database': self._get_relevant_local_context(message_text, detected_animal),  
+                'user_context': personalized_context,
+                'detected_animal': detected_animal,
+                'query_type': query_type,
+                'conversation_history': conversation_context.get('recent_messages', [])
+            }
+
+            # Stream from OpenAI
+            full_response = ""
+            async for chunk in self.enhanced_rag.stream_query_with_openai(
+                query=message_text,
+                context=full_context,
+                user_id=user_id
+            ):
+                full_response += chunk
+                yield chunk
+
+            # Track after streaming complete
+            self.memory.track_interaction(
+                user_id=user_id,
+                message=message_text,
+                response=full_response,
+                intent=self._extract_intent(message_text),
+                entities=self._extract_entities(message_text),
+                source="zoo_rag_openai_stream"
+            )
+                
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            yield "I'm having some technical difficulties, but I'm still here to help!"
+            
     def _restore_session(self, user_id: str):
         """Restore previous conversation session from database"""
         try:

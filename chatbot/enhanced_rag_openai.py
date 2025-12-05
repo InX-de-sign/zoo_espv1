@@ -311,23 +311,33 @@ class EnhancedRAGWithOpenAI:
         """Wrapper for backward compatibility"""
         return await self.process_query_with_openai(query, context or {}, user_id)
 
+
     def _build_enhanced_prompt(self, query: str, context: Dict[str, Any]) -> str:
-        """Build comprehensive prompt with all available context"""
+        """Build comprehensive prompt with CV DETECTION as TOP PRIORITY"""
         prompt_parts = []
 
+        # 🎯 CRITICAL: CV DETECTION CONTEXT FIRST (HIGHEST PRIORITY)
         try:
-            # Add CV detection context if available
-            if context.get('cv_detected') and context.get('detected_animal'):
-                detected_animal = context.get('detected_animal')
-                prompt_parts.append("IMPORTANT CONTEXT:")
-                prompt_parts.append(f"The visitor is currently viewing: {detected_animal}")
-                prompt_parts.append("Always refer to THIS animal when they say 'this one', 'this animal', 'this', 'them' or ask about details.")
+            detected_animal = context.get('detected_animal')
+            if detected_animal and isinstance(detected_animal, str) and detected_animal.strip():
+                prompt_parts.append("=" * 60)
+                prompt_parts.append("⚠️ CRITICAL CURRENT CONTEXT - READ THIS FIRST ⚠️")
+                prompt_parts.append("=" * 60)
+                prompt_parts.append(f"THE VISITOR IS CURRENTLY LOOKING AT: {detected_animal.upper()}")
+                prompt_parts.append("")
+                prompt_parts.append("IMPORTANT RULES:")
+                prompt_parts.append(f"- When they ask 'what animal am I looking at?', they mean: {detected_animal}")
+                prompt_parts.append(f"- When they say 'this one', 'this animal', 'this', 'them', they mean: {detected_animal}")
+                prompt_parts.append(f"- When they ask 'what is it?', they mean: {detected_animal}")
+                prompt_parts.append(f"- IGNORE any previous animals mentioned in conversation history")
+                prompt_parts.append(f"- The ONLY animal that matters right now is: {detected_animal}")
+                prompt_parts.append("=" * 60)
                 prompt_parts.append("")
         except Exception as e:
-            logger.debug(f"CV context error: {e}")
+            logger.debug(f"Detected animal error: {e}")
 
+        # Add local database context
         try:
-            # Add local database context
             local_db = context.get('local_database') if context else None
             if local_db and isinstance(local_db, str) and local_db.strip():
                 prompt_parts.append("ZOO ANIMAL DATABASE:")
@@ -336,8 +346,8 @@ class EnhancedRAGWithOpenAI:
         except Exception as e:
             logger.debug(f"Local database context error: {e}")
         
+        # Add user context (preferences)
         try:
-            # Add user context
             user_context = context.get('user_context') if context else None
             if user_context and isinstance(user_context, str) and user_context.strip():
                 prompt_parts.append("VISITOR PREFERENCES:")
@@ -345,39 +355,30 @@ class EnhancedRAGWithOpenAI:
                 prompt_parts.append("")
         except Exception as e:
             logger.debug(f"User context error: {e}")
-        
-        try:
-            # Add detected animal focus
-            detected_animal = context.get('detected_animal') if context else None
-            if detected_animal and isinstance(detected_animal, str) and detected_animal.strip():
-                prompt_parts.append(f"PRIMARY FOCUS: {detected_animal}")
-                prompt_parts.append("")
-        except Exception as e:
-            logger.debug(f"Detected animal error: {e}")
 
+        # Add conversation history LAST (lowest priority)
         try:
-            # Add conversation history
             conversation_history = context.get('conversation_history', []) if context else []
             if conversation_history and len(conversation_history) > 0:
-                prompt_parts.append("RECENT CONVERSATION:")
-                for i, prev_msg in enumerate(conversation_history[-3:], 1):  # Last 3 messages
+                prompt_parts.append("PREVIOUS CONVERSATION (FOR REFERENCE ONLY):")
+                prompt_parts.append("⚠️ NOTE: This history may mention OTHER animals. Ignore them if CV detection shows a different animal.")
+                for i, prev_msg in enumerate(conversation_history[-3:], 1):
                     if isinstance(prev_msg, str) and prev_msg.strip():
                         prompt_parts.append(f"  {i}. Visitor asked: {prev_msg}")
                 prompt_parts.append("")
-                prompt_parts.append("IMPORTANT: Use this conversation history to understand context and pronouns like 'they', 'them', 'those animals'.")
-                prompt_parts.append("")
         except Exception as e:
             logger.debug(f"Conversation history error: {e}")
-    
         
-        # Add the actual user query
+        # Add the actual user query AFTER context
         if query and isinstance(query, str):
-            prompt_parts.append("VISITOR QUESTION:")
+            prompt_parts.append("=" * 60)
+            prompt_parts.append("CURRENT VISITOR QUESTION:")
             prompt_parts.append(query)
+            prompt_parts.append("=" * 60)
             prompt_parts.append("")
         
         return "\n".join(prompt_parts) if prompt_parts else f"VISITOR QUESTION: {query}"
-
+        
     async def _call_openai_api(self, system_prompt: str, user_prompt: str) -> Optional[str]:
         """Call OpenAI API with error handling"""
         try:

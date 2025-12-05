@@ -12,9 +12,9 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Zoo Animal Detection Service")
+app = FastAPI(title="Museum YOLO Inference Service")
 
-class AnimalDetector:
+class ArtworkDetector:
     def __init__(self, model_path):
         self.session = ort.InferenceSession(model_path)
         self.input_name = self.session.get_inputs()[0].name
@@ -23,16 +23,11 @@ class AnimalDetector:
         width = self.input_shape[3] if isinstance(self.input_shape[3], int) else 640
         self.input_size = (height, width)    
 
-        # 8 animal classes from your trained model
+        # Your 3 museum artworks
         self.classes = [
-            'arctic-fox',
-            'capybara', 
-            'harbor-seal',
-            'panda',
-            'parrot',
-            'penguin',
-            'red-panda',
-            'sloth'
+            'The Progress of a Soul: The Victory',
+            'The Execution of Lady Jane Grey',
+            'Café Terrace at Night'
         ]
         
         self.confidence_threshold = 0.5
@@ -49,20 +44,18 @@ class AnimalDetector:
     def postprocess(self, outputs, original_shape):
         """Extract detections from model outputs"""
         try:
-            # YOLOv8 output shape: (1, 12, 8400)
-            # 12 = 4 bbox coords + 8 class scores
-            predictions = outputs[0][0]  # Shape: (12, 8400)
+            predictions = outputs[0][0]  # Shape: (7, 8400)
             
-            # Transpose to (8400, 12) - iterate over boxes
+            # Transpose to (8400, 7) - iterate over boxes
             predictions = predictions.T
             
             detections = []
             
             for pred in predictions:
                 # pred[0:4] = bbox (cx, cy, w, h)
-                # pred[4:12] = 8 class scores (one per animal)
+                # pred[4:7] = class scores (no objectness score in this model)
                 
-                class_scores = pred[4:12]  # 8 class scores
+                class_scores = pred[4:7]  # 3 class scores
                 class_id = np.argmax(class_scores)
                 confidence = float(class_scores[class_id])
                 
@@ -125,7 +118,7 @@ class AnimalDetector:
         return detections
 
 # Global state
-animal_model = None
+artwork_model = None
 latest_results = []
 frame_count = 0
 last_inference_time = 0
@@ -135,7 +128,7 @@ inference_active = False
 # Configuration from environment variables
 CHATBOT_URL = os.getenv("CHATBOT_URL", "http://museum_chatbot:8000")
 RTSP_URL = os.getenv("RTSP_URL", "rtsp://mediamtx:8554/cam1")
-MODEL_PATH = os.getenv("MODEL_PATH", "/inference/models/best_animal_v3.onnx")
+MODEL_PATH = os.getenv("MODEL_PATH", "/inference/models/best_detect.onnx")
 INFERENCE_INTERVAL = float(os.getenv("INFERENCE_INTERVAL", "0.5"))  # 2 FPS default
 DETECTION_COOLDOWN = int(os.getenv("DETECTION_COOLDOWN", "5"))  # 5 seconds
 
@@ -158,7 +151,7 @@ async def send_detection_to_chatbot(label: str, confidence: float, user_id: str 
         return None
 
 def should_send_detection(label: str) -> bool:
-    """Check if enough time has passed since last detection of this animal"""
+    """Check if enough time has passed since last detection of this artwork"""
     current_time = time.time()
     
     if label not in last_sent_detections:
@@ -174,17 +167,15 @@ def should_send_detection(label: str) -> bool:
 
 def initialize_model():
     """Load ONNX model on startup"""
-    global animal_model
+    global artwork_model
     try:
-        logger.info(f"Loading YOLO animal detection model from {MODEL_PATH}")
-        animal_model = AnimalDetector(MODEL_PATH)
-        logger.info("✅ Animal detection model loaded successfully")
-        logger.info(f"Model classes: {animal_model.classes}")
+        logger.info(f"Loading YOLO model from {MODEL_PATH}")
+        artwork_model = ArtworkDetector(MODEL_PATH)
+        logger.info("✅ Artwork detection model loaded successfully")
+        logger.info(f"Model classes: {artwork_model.classes}")
         return True
     except Exception as e:
         logger.error(f"❌ Error loading model: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         return False
 
 async def process_frames():
@@ -204,7 +195,7 @@ async def process_frames():
         inference_active = False
         return
     
-    logger.info("✅ Connected to RTSP stream, starting animal detection...")
+    logger.info("✅ Connected to RTSP stream, starting artwork detection...")
     
     try:
         while inference_active:
@@ -220,9 +211,9 @@ async def process_frames():
             
             # Process frames at configured interval (default 2 FPS)
             if current_time - last_inference_time >= INFERENCE_INTERVAL:
-                if animal_model:
+                if artwork_model:
                     try:
-                        detections = animal_model.detect(frame)
+                        detections = artwork_model.detect(frame)
                         latest_results = detections
                         
                         # Send detections to chatbot
@@ -232,11 +223,11 @@ async def process_frames():
                             
                             # Only send if cooldown period has passed
                             if should_send_detection(label):
-                                logger.info(f"🐾 Detected: {label} (confidence: {confidence:.2f})")
+                                logger.info(f"🎨 Detected: {label} (confidence: {confidence:.2f})")
                                 await send_detection_to_chatbot(label, confidence)
                             
                         if not detections:
-                            logger.debug("No animals detected in frame")
+                            logger.debug("No artworks detected in frame")
                             
                     except Exception as e:
                         logger.error(f"Detection error: {e}")
@@ -278,7 +269,7 @@ async def get_detections():
         'detections': latest_results,
         'frame_count': frame_count,
         'timestamp': datetime.now().isoformat(),
-        'model_loaded': animal_model is not None,
+        'model_loaded': artwork_model is not None,
         'inference_active': inference_active
     }
 
@@ -286,9 +277,9 @@ async def get_detections():
 async def health_check():
     """Health check endpoint"""
     return {
-        'status': 'healthy' if animal_model is not None else 'unhealthy',
-        'model_loaded': animal_model is not None,
-        'model_classes': animal_model.classes if animal_model else [],
+        'status': 'healthy' if artwork_model is not None else 'unhealthy',
+        'model_loaded': artwork_model is not None,
+        'model_classes': artwork_model.classes if artwork_model else [],
         'inference_active': inference_active,
         'chatbot_url': CHATBOT_URL,
         'rtsp_url': RTSP_URL
@@ -298,8 +289,8 @@ async def health_check():
 async def get_status():
     """Detailed status information"""
     return {
-        "service": "Zoo Animal Detection",
-        "model_loaded": animal_model is not None,
+        "service": "YOLO Inference",
+        "model_loaded": artwork_model is not None,
         "inference_active": inference_active,
         "rtsp_url": RTSP_URL,
         "chatbot_url": CHATBOT_URL,
@@ -314,7 +305,7 @@ async def get_status():
 async def start_inference():
     """Manually start inference"""
     global inference_active
-    if not inference_active and animal_model is not None:
+    if not inference_active and artwork_model is not None:
         asyncio.create_task(process_frames())
         return {"status": "started"}
     return {"status": "already_running" if inference_active else "model_not_loaded"}
@@ -347,58 +338,32 @@ async def root():
     if latest_results:
         detection_summary = "<ul>"
         for detection in latest_results:
-            detection_summary += f"<li>🐾 {detection['class']} - {detection['confidence']:.2f}</li>"
+            detection_summary += f"<li>{detection['class']} - {detection['confidence']:.2f}</li>"
         detection_summary += "</ul>"
     else:
-        detection_summary = "<p>No animals detected</p>"
+        detection_summary = "<p>No artworks detected</p>"
     
     return f"""
     <html>
         <head>
-            <title>Zoo Animal Detection</title>
+            <title>Museum Artwork Detection</title>
             <meta http-equiv="refresh" content="2">
             <style>
                 body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
                 .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
                 .status {{ background: #e8f5e9; padding: 10px; border-radius: 5px; margin: 10px 0; }}
                 .detection {{ background: #f0f0f0; padding: 10px; margin: 5px; border-radius: 5px; }}
-                .animal-grid {{
-                    display: grid;
-                    grid-template-columns: repeat(4, 1fr);
-                    gap: 10px;
-                    margin: 20px 0;
-                }}
-                .animal-card {{
-                    background: #f0f0f0;
-                    padding: 10px;
-                    border-radius: 5px;
-                    text-align: center;
-                    font-size: 0.9em;
-                }}
             </style>
         </head>
         <body>
             <div class="container">
-                <h1>🐾 Zoo Animal Detection Service</h1>
+                <h1>🎨 Museum Artwork Detection Service</h1>
                 <div class="status">
-                    <p><strong>Model Status:</strong> {"✅ Loaded" if animal_model else "❌ Not Loaded"}</p>
+                    <p><strong>Model Status:</strong> {"✅ Loaded" if artwork_model else "❌ Not Loaded"}</p>
                     <p><strong>Inference Active:</strong> {"✅ Running" if inference_active else "❌ Stopped"}</p>
                     <p><strong>Frames Processed:</strong> {frame_count}</p>
                     <p><strong>Current Detections:</strong> {len(latest_results)}</p>
                 </div>
-                
-                <h3>Detectable Animals:</h3>
-                <div class="animal-grid">
-                    <div class="animal-card">🦊 Arctic Fox</div>
-                    <div class="animal-card">🦫 Capybara</div>
-                    <div class="animal-card">🦭 Harbor Seal</div>
-                    <div class="animal-card">🐼 Panda</div>
-                    <div class="animal-card">🦜 Parrot</div>
-                    <div class="animal-card">🐧 Penguin</div>
-                    <div class="animal-card">🦝 Red Panda</div>
-                    <div class="animal-card">🦥 Sloth</div>
-                </div>
-                
                 <div class="detections">
                     <h3>Latest Detections:</h3>
                     {detection_summary}
@@ -415,5 +380,5 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("🚀 Starting Zoo Animal Detection Service")
+    logger.info("🚀 Starting Museum YOLO Inference Service")
     uvicorn.run(app, host="0.0.0.0", port=5000)

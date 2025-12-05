@@ -15,136 +15,6 @@
 #include <ESPmDNS.h>
 #include "base64.h"
 
-// Audio Stream Queue System
-#define MAX_AUDIO_STREAMS 5
-#define STREAM_BUFFER_SIZE 65536  // 64KB per stream
-
-struct AudioStream {
-    uint8_t* data;
-    size_t size;
-    size_t capacity;
-    bool complete;
-    unsigned long streamId;
-};
-
-class AudioStreamQueue {
-private:
-    AudioStream streams[MAX_AUDIO_STREAMS];
-    int readIndex = 0;      // Points to the stream being played
-    int writeIndex = 0;     // Points to the stream currently receiving data
-    int nextStreamIndex = 0; // Points to where the NEXT stream will be allocated
-    int count = 0;
-
-public:
-    bool startNewStream(unsigned long streamId) {
-        if (count >= MAX_AUDIO_STREAMS) {
-            Serial.println("⚠️ Queue full!");
-            return false;
-        }
-        
-        // Use nextStreamIndex for allocation
-        if (streams[nextStreamIndex].data) {
-            heap_caps_free(streams[nextStreamIndex].data);
-            streams[nextStreamIndex].data = nullptr;
-        }
-        
-        streams[nextStreamIndex].data = (uint8_t*)heap_caps_malloc(STREAM_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
-        if (!streams[nextStreamIndex].data) {
-            Serial.println("❌ Stream allocation failed!");
-            return false;
-        }
-        
-        streams[nextStreamIndex].capacity = STREAM_BUFFER_SIZE;
-        streams[nextStreamIndex].size = 0;
-        streams[nextStreamIndex].complete = false;
-        streams[nextStreamIndex].streamId = streamId;
-        
-        Serial.printf("✅ Started stream %d (ID: %lu)\n", nextStreamIndex, streamId);
-        
-        // Set writeIndex to the stream we just allocated
-        writeIndex = nextStreamIndex;
-        
-        count++;
-        nextStreamIndex = (nextStreamIndex + 1) % MAX_AUDIO_STREAMS;
-        
-        return true;
-    }
-    
-    bool addData(const uint8_t* data, size_t len) {
-        if (count == 0 || !streams[writeIndex].data) {
-            return false;
-        }
-        
-        if (streams[writeIndex].size + len > streams[writeIndex].capacity) {
-            Serial.printf("⚠Stream %d buffer full!\n", writeIndex);
-            Serial.printf("⚠Failed to add %d bytes\n", len);
-            return false;
-        }
-        
-        memcpy(streams[writeIndex].data + streams[writeIndex].size, data, len);
-        streams[writeIndex].size += len;
-        return true;
-    }
-    
-    void completeCurrentStream() {
-        if (count == 0) return;
-        
-        streams[writeIndex].complete = true;
-        Serial.printf("✅ Stream %d complete: %d bytes\n", writeIndex, streams[writeIndex].size);
-    }
-    
-    AudioStream* getCurrentPlaybackStream() {
-        if (count == 0) return nullptr;
-        return &streams[readIndex];
-    }
-    
-    void advancePlayback() {
-        if (count == 0) return;
-        
-        // Free the completed stream
-        if (streams[readIndex].data) {
-            heap_caps_free(streams[readIndex].data);
-            streams[readIndex].data = nullptr;
-        }
-        streams[readIndex].size = 0;
-        streams[readIndex].complete = false;
-        
-        count--;
-        readIndex = (readIndex + 1) % MAX_AUDIO_STREAMS;
-        
-        Serial.printf("Advanced to stream %d (%d remaining)\n", readIndex, count);
-    }
-    
-    int getCount() const {
-        return count;
-    }
-    
-    bool hasCompleteStream() {
-        if (count == 0) return false;
-        return streams[readIndex].complete;
-    }
-    
-    // ADD THIS METHOD - it's what your code is calling!
-    bool hasStreams() {
-        return count > 0;
-    }
-    
-    void clear() {
-        for (int i = 0; i < MAX_AUDIO_STREAMS; i++) {
-            if (streams[i].data) {
-                heap_caps_free(streams[i].data);
-                streams[i].data = nullptr;
-            }
-            streams[i].size = 0;
-            streams[i].complete = false;
-        }
-        readIndex = 0;
-        writeIndex = 0;
-        nextStreamIndex = 0;
-        count = 0;
-    }
-};
-
 // Simple Circular Buffer for Audio Streaming
 template<typename T, size_t SIZE>
 class SimpleCircularBuffer {
@@ -258,14 +128,25 @@ bool audio_received = false;
 
 String deviceId = CLIENT_ID;
 
+// ==================== DELETE THESE LINES (around line 40-45): ====================
+// uint8_t *playback_buffer = NULL;
+// size_t playback_size = 0;
+// size_t playback_buffer_capacity = 0;
 
 // ==================== ADD THESE NEW LINES: ====================
 #define CIRCULAR_BUFFER_SIZE 262144  // 256KB circular buffer in PSRAM
 
-AudioStreamQueue audioQueue;
+SimpleCircularBuffer<uint8_t, CIRCULAR_BUFFER_SIZE> audioCircularBuffer;
+
+// Playback state tracking
 bool isPlayingAudio = false;
-unsigned long currentStreamId = 0;
-int streamCounter = 0;
+bool audioStreamComplete = false;
+size_t totalBytesExpected = 0;
+size_t totalBytesReceived = 0;
+size_t audioStartOffset = 44;  // Skip WAV header when playing
+
+bool streamActive = false;  // Track if we're receiving a stream
+unsigned long activeStreamId = 0; 
 
 // ==================== CONNECTION TEST ====================
 bool testServerConnection() {
@@ -434,24 +315,54 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             Serial.println("💬 AI Response: " + text);
           }
           else if (msgType == "tts_start") {
-            Serial.println("Audio incoming from server...");
+            Serial.println("📊 Audio incoming from server...");
             
-            // Start a new stream
-            streamCounter++;
-            if (audioQueue.startNewStream(streamCounter)) {
-                Serial.printf("Stream %d started\n", streamCounter);
+            if (!streamActive) {
+                // This is the first stream - accept it
+                audioCircularBuffer.clear();
+                isPlayingAudio = false;
+                audioStreamComplete = false;
+                totalBytesReceived = 0;
+                streamActive = true;
+                activeStreamId = millis();  // Use timestamp as stream ID
+                
+                totalBytesExpected = doc["total_bytes"];
+                audioStartOffset = 44;
+                
+                Serial.println("🔄 Starting new audio stream");
+                Serial.printf("📦 Expecting %d bytes, Buffer has %d bytes free\n", 
+                            totalBytesExpected, audioCircularBuffer.free());
             } else {
-                Serial.println("❌Failed to start stream - queue full");
+                // Already have an active stream - REJECT this one
+                Serial.println("⚠️ Rejecting duplicate tts_start - stream already active");
+                return;  // ✅ Don't update totalBytesExpected
             }
-          }
+                              
+            if (!audioCircularBuffer.isAllocated()) {
+                Serial.println("❌ Circular buffer not allocated!");
+                webSocket.sendTXT("{\"type\":\"error\",\"message\":\"Buffer not allocated\"}");
+                waiting_for_response = false;
+                return;
+            }
+        }
           else if (msgType == "tts_complete") {
-              if (audioQueue.getCount() > 0) {  // Only if we have streams
-                  audioQueue.completeCurrentStream();
+              if (streamActive) {
+                  audioStreamComplete = true;
+                  streamActive = false;  
                   
-                  if (!isPlayingAudio && audioQueue.hasStreams()) {
-                      Serial.println("Starting playback queue...");
+                  Serial.printf("✅ Audio stream complete: %d bytes received\n", totalBytesReceived);
+                  
+                  // Start playback if not already playing
+                  if (!isPlayingAudio && audioCircularBuffer.available() > audioStartOffset) {
+                      Serial.println("🔊 Starting playback...");
                       isPlayingAudio = true;
+                      audio_received = true;
                   }
+                  
+                  waiting_for_response = false;
+              } else {
+                  // Duplicate tts_complete - ignore
+                  Serial.println("⚠️ Ignoring duplicate tts_complete");
               }
           }
           else if (msgType == "error") {
@@ -464,30 +375,57 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       break;
       
     case WStype_BIN:
-        {
-            // Add to current stream in queue
-            if (audioQueue.addData(payload, length)) {
-                // Data added successfully
-                if (length > 4096) {  // Log large chunks
-                    Serial.printf("Added %d bytes to stream\n", length);
-                }
-            } else {
-                Serial.printf("⚠️Failed to add %d bytes\n", length);
-            }
-            
-            // Start playback once first stream has enough data
-            if (!isPlayingAudio && audioQueue.hasStreams()) {
-                AudioStream* stream = audioQueue.getCurrentPlaybackStream();
-                if (stream && stream->size > 8192) {  // 8KB threshold
-                    Serial.println("Starting playback...");
-                    isPlayingAudio = true;
-                }
-            }
-            
-            yield();
-        }
-        break;
+      {
+          if (!audioCircularBuffer.isAllocated()) {
+              Serial.println("❌ Circular buffer not allocated!");
+              return;
+          }
+          
+          if (!streamActive) {
+              Serial.println("⚠️ Rejecting binary data - no active stream");
+              return;
+          }
 
+          // Add bytes to circular buffer
+          size_t bytesAdded = 0;
+          for (size_t i = 0; i < length; i++) {
+              if (audioCircularBuffer.push(payload[i])) {
+                  bytesAdded++;
+              } else {
+                  // Buffer full - wait for playback to consume data
+                  if (i == 0) {
+                      Serial.printf("⚠️ Buffer full! Waiting for playback...\n");
+                  }
+                  break;
+              }
+          }
+          
+          totalBytesReceived += bytesAdded;
+          
+          // Progress logging
+          if (totalBytesReceived % 20480 == 0) {
+              Serial.printf("📦 Received: %d KB / %d KB (Buffer: %d/%d bytes)\n", 
+                          totalBytesReceived / 1024,
+                          totalBytesExpected / 1024,
+                          audioCircularBuffer.available(),
+                          CIRCULAR_BUFFER_SIZE);
+          }
+          
+          // Start playback once we have enough buffered data
+          if (!isPlayingAudio && audioCircularBuffer.available() > 16384) {  // 16KB threshold
+              Serial.println("🔊 Buffer ready - starting playback");
+              isPlayingAudio = true;
+              audio_received = true;
+          }
+          
+          if (bytesAdded < length) {
+              Serial.printf("⚠️ Only buffered %d/%d bytes (buffer full)\n", bytesAdded, length);
+          }
+          
+          yield();
+      }
+      break;
+      
     case WStype_ERROR:
       Serial.println("❌ WebSocket ERROR!");
       waiting_for_response = false;
@@ -626,88 +564,77 @@ void send_audio_to_server() {
 }
 
 void play_response_audio() {
-    static size_t playbackOffset = 44;  // Skip WAV header
+    static size_t totalPlayed = 0;
     static bool headerSkipped = false;
     
-    if (!audioQueue.hasStreams()) {
-        if (isPlayingAudio) {
-            // All streams played
+    if (!audioCircularBuffer.isAllocated() || audioCircularBuffer.isEmpty()) {
+        // Check if playback is complete
+        if (isPlayingAudio && audioStreamComplete) {
+            // Playback finished
             digitalWrite(I2S_SD_SPK, LOW);
-            Serial.println("✅ All streams played!");
+            Serial.printf("✅ Playback complete! Played %d bytes\n", totalPlayed);
+            
+            // Reset state
             isPlayingAudio = false;
-            playbackOffset = 44;
+            audio_received = false;
+            audioCircularBuffer.clear();
+            totalBytesReceived = 0;
+            totalBytesExpected = 0;
+            totalPlayed = 0;
             headerSkipped = false;
-            waiting_for_response = false;
         }
         return;
     }
-    
-    AudioStream* current = audioQueue.getCurrentPlaybackStream();
 
-    if (!current || !current->data) {
-        Serial.println("⏳ Waiting for stream data...");
-        return;  // Exit early if stream not ready
+    if (audio_received && !headerSkipped && totalPlayed == 0) {
+        // This is a new playback session
+        totalPlayed = 0;
+        headerSkipped = false;
     }
-
-    const size_t MIN_BUFFER_SIZE = 4096; 
-
-    // Skip header on first call for this stream
+    
+    // First call - initialize playback
     if (!headerSkipped) {
-        // Wait for minimum buffer before starting
-        if (current->size < MIN_BUFFER_SIZE) {
-            // Don't spam logs - only show every 10th check
-            static int bufferWaitCount = 0;
-            if (++bufferWaitCount % 10 == 0) {
-                Serial.printf("⏳ Buffering: %d/%d bytes...\n", current->size, MIN_BUFFER_SIZE);
-            }
-            return;
-        }
-        
-        Serial.printf("📊 Playing stream (size: %d bytes)\n", current->size);
+        Serial.println("🔊 Starting playback from circular buffer...");
         digitalWrite(I2S_SD_SPK, HIGH);
-        playbackOffset = 44;
-        headerSkipped = true;
-    }
-
-    // Play one chunk
-    const size_t CHUNK_SIZE = 1024;
-    
-    if (playbackOffset < current->size) {
-        size_t remaining = current->size - playbackOffset;
-        size_t toPlay = (remaining > CHUNK_SIZE) ? CHUNK_SIZE : remaining;
         
-        size_t written = 0;
-        i2s_write(I2S_NUM_1, current->data + playbackOffset, toPlay, &written, portMAX_DELAY);
-        playbackOffset += written;
-        
-        // Progress every 10KB
-        if (playbackOffset % 10240 == 0) {
-            float progress = (playbackOffset * 100.0f) / current->size;
-            Serial.printf(" Playing: %.0f%% (%d/%d bytes)\n", 
-                         progress, playbackOffset, current->size);
+        // Skip WAV header (first 44 bytes)
+        uint8_t headerByte;
+        for (int i = 0; i < 44 && audioCircularBuffer.available() > 0; i++) {
+            audioCircularBuffer.pop(headerByte);
         }
-    } else {
-        // This stream is finished - but only advance if it's marked complete!
-        if (current->complete || audioQueue.getCount() > 1) {
-            // Either this stream is marked complete, OR there's another stream ready
-            Serial.printf("✅ Stream complete: %d bytes played\n", playbackOffset);
-            
-            audioQueue.advancePlayback();
-            playbackOffset = 44;
-            headerSkipped = false;
-            
-            // NO DELAY - immediately start next stream if available
-            if (!audioQueue.hasStreams()) {
-                digitalWrite(I2S_SD_SPK, LOW);
-                isPlayingAudio = false;
-                waiting_for_response = false;
-            }
+        headerSkipped = true;
+        totalPlayed = 0;
+    }
+    
+    // Play one chunk (non-blocking)
+    const size_t PLAY_CHUNK_SIZE = 512;
+    uint8_t playChunk[PLAY_CHUNK_SIZE];
+    size_t chunkFilled = 0;
+    
+    // Fill chunk from buffer
+    for (size_t i = 0; i < PLAY_CHUNK_SIZE; i++) {
+        uint8_t sample;
+        if (audioCircularBuffer.pop(sample)) {
+            playChunk[i] = sample;
+            chunkFilled++;
         } else {
-            static unsigned long lastWaitLog = 0;
-            if (millis() - lastWaitLog > 100) {  // Log every 100ms max
-                Serial.println("⏳ Waiting for stream completion...");
-                lastWaitLog = millis();
-            }
+            break;  // Buffer empty
+        }
+    }
+    
+    // Play the chunk
+    if (chunkFilled > 0) {
+        size_t written = 0;
+        i2s_write(I2S_NUM_1, playChunk, chunkFilled, &written, portMAX_DELAY);
+        totalPlayed += written;
+        
+        // Progress indicator every 20KB
+        if (totalPlayed % 20480 == 0) {
+            float progress = (totalBytesExpected > 0) 
+                ? (totalPlayed * 100.0f / (totalBytesExpected - 44))
+                : 0;
+            Serial.printf("🎵 Playing: %.0f%% (%d bytes, buffer: %d)\n", 
+                         progress, totalPlayed, audioCircularBuffer.available());
         }
     }
 }
@@ -732,6 +659,11 @@ void setup() {
     while (1);
   }
   Serial.println("✅ PSRAM detected");
+
+  if (!audioCircularBuffer.init()) {
+    Serial.println("❌ FATAL: Could not allocate audio buffer!");
+    while (1);  // Halt - can't continue without buffer
+  }
   
   // I2S Microphone
   i2s_config_t rx = {
@@ -858,24 +790,33 @@ void loop() {
       send_audio_to_server();
       Serial.println("⏳ Waiting for server response...");
 
-    } else{
-        // Interruption - clear queue
-        Serial.println("Interrupting previous response...");
-        
-        audioQueue.clear();  // Clear all queued streams
-        isPlayingAudio = false;
-        
-        Serial.println("Starting new recording...\n");
-        
-        record_audio();
-        send_audio_to_server();
-        Serial.println("Waiting for server response...");
+    } else {
+      // interruptions
+      Serial.println("⚠️ Still waiting for previous response...");
+
+      // Cancel previous audio
+      waiting_for_response = false;
+      audio_received = false;
+      
+      // Clear circular buffer instead
+      audioCircularBuffer.clear();
+      isPlayingAudio = false;
+      audio_received = false;
+
+      Serial.println("🎬 Starting new recording...\n");
+      
+      size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+      Serial.printf("Free PSRAM: %d bytes\n", free_psram);
+      
+      record_audio();
+      send_audio_to_server();
+      Serial.println("⏳ Waiting for server response...");
     }
   }
   
   lastButtonState = currentButtonState;
   
-  if (isPlayingAudio) {
+  if (audio_received && isPlayingAudio) {
     play_response_audio();
   }
 
