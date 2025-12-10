@@ -7,6 +7,19 @@ import re
 from typing import Dict, Any, Optional, AsyncGenerator
 import asyncio
 from config import load_azure_openai_config
+from park_knowledge import (
+    PARK_INFO,
+    PARK_ANIMAL_INFO,
+    get_attraction_info, 
+    get_directions, 
+    get_zone_attractions,
+    find_animal_location,
+    get_all_animals_in_gallery,
+    get_galleries_by_zone,
+    get_all_galleries_summary,
+    get_detailed_attraction_info,
+    search_animal_detailed_info
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -244,6 +257,119 @@ class EnhancedRAGWithOpenAI:
             
             return " ".join(response_parts)
     
+    def get_park_info_context(self, query: str) -> Optional[str]:
+        """Get park information from static knowledge base with enhanced animal location search"""
+        query_lower = query.lower()
+        context_parts = []
+        
+        # 🆕 PRIORITY 1: Search in PARK_ANIMAL_INFO for detailed attraction/animal info
+        # Check for specific animals or attractions
+        animal_results = search_animal_detailed_info(query)
+        if animal_results:
+            for attraction_data in animal_results[:2]:  # Limit to top 2 results
+                context_parts.append(f"\n🐾 {attraction_data['name'].upper()}:")
+                context_parts.append(f"Location: {attraction_data['location']}")
+                context_parts.append(f"Zone: {attraction_data['zone']}")
+                context_parts.append(f"Description: {attraction_data['description'][:300]}...")
+                if attraction_data.get('animals'):
+                    context_parts.append(f"Animals: {', '.join(attraction_data['animals'][:5])}")
+                if attraction_data.get('highlights'):
+                    context_parts.append(f"Highlights: {' | '.join(attraction_data['highlights'][:3])}")
+                if attraction_data.get('what_near_by'):
+                    context_parts.append(f"Nearby: {attraction_data['what_near_by']}")
+        
+        # 🆕 Check for crocodile specifically
+        if 'croc' in query_lower:
+            croco_info = get_detailed_attraction_info("Croco Land")
+            if croco_info:
+                context_parts.append(f"\n🐊 CROCO LAND:")
+                context_parts.append(f"Location: {croco_info['location']}")
+                context_parts.append(f"Description: {croco_info['description'][:200]}...")
+                context_parts.append(f"Animals: {', '.join(croco_info.get('animals', []))}")
+        
+        # Check for ride/attraction queries
+        if any(word in query_lower for word in ['ride', 'roller coaster', 'galleon', 'hair raiser', 'flash', 'rapids']):
+            rides = PARK_INFO.get("activities", {}).get("Rides", {}).get("attractions", [])
+            for ride in rides:
+                if any(word in ride['name'].lower() for word in query_lower.split()):
+                    context_parts.append(f"\n🎢 {ride['name'].upper()}:")
+                    context_parts.append(f"Location: {ride['location']}")
+                    context_parts.append(f"Requirements: {', '.join(ride.get('special_notes', []))}")
+        
+        # Check for family attraction queries
+        if any(word in query_lower for word in ['family', 'carousel', 'ferris wheel', 'castle', 'old hong kong']):
+            family = PARK_INFO.get("activities", {}).get("Family Attractions", {}).get("attractions", [])
+            for attraction in family:
+                if any(word in attraction['name'].lower() for word in query_lower.split()):
+                    context_parts.append(f"\n🎠 {attraction['name'].upper()}:")
+                    context_parts.append(f"Location: {attraction['location']}")
+                    if attraction.get('special_notes'):
+                        context_parts.append(f"Info: {', '.join(attraction['special_notes'])}")
+        
+        # 🆕 Check if asking about specific animal location using helper function
+        animal_keywords = ["panda", "penguin", "seal", "sea lion", "walrus", "shark", "capybara", "sloth", 
+                          "fox", "otter", "salamander", "alligator", "macaw", "jellyfish", "goldfish",
+                          "meerkat", "tortoise", "dolphin", "crocodile"]
+        
+        for animal in animal_keywords:
+            if animal in query_lower:
+                location_info = find_animal_location(animal)
+                if location_info:
+                    context_parts.append(f"\n🐾 {animal.upper()} LOCATION:")
+                    context_parts.append(f"Gallery: {location_info['gallery']}")
+                    context_parts.append(f"Zone: {location_info['zone']}")
+                    if 'description' in location_info:
+                        context_parts.append(f"About: {location_info['description'][:200]}...")
+                    if 'highlights' in location_info and location_info['highlights']:
+                        context_parts.append(f"Fun Facts: {' | '.join(location_info['highlights'][:2])}")
+        
+        # Check for "how many galleries" or "all animals" queries
+        if any(phrase in query_lower for phrase in ['how many', 'all galleries', 'all animals', 'what animals']):
+            summary = get_all_galleries_summary()
+            context_parts.append(f"\n📊 OCEAN PARK GALLERIES:")
+            context_parts.append(f"Total animal galleries: {summary['total_galleries']}")
+            context_parts.append(f"Waterfront zone: {summary['waterfront_galleries']} galleries")
+            context_parts.append(f"Summit zone: {summary['summit_galleries']} galleries")
+        
+        # Check for direction queries
+        if any(word in query_lower for word in ['where', 'find', 'how to get', 'directions', 'location']):
+            directions = get_directions(query)
+            if directions:
+                context_parts.append(f"\n🗺️ DIRECTIONS: {directions}")
+        
+        # Check for opening hours
+        if any(word in query_lower for word in ['hours', 'open', 'close', 'time', 'when']) and "general_info" in PARK_INFO:
+            hours = PARK_INFO["general_info"]["opening_hours"]
+            context_parts.append(f"HOURS: Regular hours {hours['regular']}, Peak season {hours['peak_season']}")
+        
+        # Check for transport info
+        if any(word in query_lower for word in ['how to get', 'transport', 'mtr', 'bus', 'travel', 'cable car', 'ocean express']) and "general_info" in PARK_INFO:
+            if "cable car" in query_lower or "ocean express" in query_lower:
+                transport_info = PARK_INFO.get("activities", {}).get("In-Park Transportation", {}).get("attractions", [])
+                for trans in transport_info:
+                    if any(word in trans['name'].lower() for word in query_lower.split()):
+                        context_parts.append(f"\n🚡 {trans['name'].upper()}:")
+                        context_parts.append(f"Location: {trans['location']}")
+                        context_parts.append(f"Info: {', '.join(trans.get('special_notes', []))}")
+            else:
+                transport = PARK_INFO["general_info"]["location"]["transport"]
+                context_parts.append(f"TRANSPORT: {', '.join(transport)}")
+        
+        # Check for zone/area info
+        if any(word in query_lower for word in ['waterfront', 'summit', 'zone', 'area']) and "general_info" in PARK_INFO:
+            if "zones" in PARK_INFO["general_info"]:
+                context_parts.append(f"ZONES: Waterfront has {', '.join(PARK_INFO['general_info']['zones']['Waterfront'])}")
+                context_parts.append(f"Summit has {', '.join(PARK_INFO['general_info']['zones']['Summit'])}")
+            if "transport_between_zones" in PARK_INFO["general_info"]:
+                context_parts.append(f"TRANSPORT BETWEEN ZONES: {', '.join(PARK_INFO['general_info']['transport_between_zones'])}")
+        
+        # Check for conservation info
+        if any(word in query_lower for word in ['conservation', 'protect', 'save', 'research']) and "conservation" in PARK_INFO:
+            context_parts.append(f"CONSERVATION: {PARK_INFO['conservation']['message']}")
+            context_parts.append(f"PROGRAMS: {', '.join(PARK_INFO['conservation']['programs'])}")
+        
+        return "\n".join(context_parts) if context_parts else None
+    
     async def stream_query_with_openai(self, query: str, context: Dict[str, Any], user_id: str) -> AsyncGenerator[str, None]:
         """Stream OpenAI response for real-time TTS"""
         try:
@@ -268,6 +394,13 @@ class EnhancedRAGWithOpenAI:
                     animal_data = self.enhanced_animal_search(query, animal)
                     if animal_data:
                         context['local_database'] = self._format_animal_data(animal_data)
+            
+            # 🆕 Add park information context
+            if not context.get('park_info'):
+                park_info = self.get_park_info_context(query)
+                if park_info:
+                    context['park_info'] = park_info
+                    logger.info(f"📍 Added park info context: {len(park_info)} chars")
             
             # Determine system prompt based on query type
             query_type = context.get('query_type', 'general_animal_knowledge')
@@ -345,6 +478,16 @@ class EnhancedRAGWithOpenAI:
                 prompt_parts.append("")
         except Exception as e:
             logger.debug(f"Local database context error: {e}")
+        
+        # 🆕 Add park information context
+        try:
+            park_info = context.get('park_info') if context else None
+            if park_info and isinstance(park_info, str) and park_info.strip():
+                prompt_parts.append("OCEAN PARK INFORMATION:")
+                prompt_parts.append(park_info)
+                prompt_parts.append("")
+        except Exception as e:
+            logger.debug(f"Park info context error: {e}")
         
         # Add user context (preferences)
         try:

@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import io
+import wave
 from typing import Optional
 from fastapi import WebSocket
 from pydub import AudioSegment
@@ -18,59 +19,38 @@ class ESP32TTSStreamer:
     
     async def stream_response_to_esp32(self, text: str, websocket: WebSocket, client_id: str):
         """
-        Complete workflow: Text → Google TTS → Convert to ESP32 format → Stream
-        
-        ESP32 Audio Requirements:
-        - Format: WAV
-        - Sample Rate: 16kHz (ESP32-friendly)
-        - Channels: Mono
-        - Bit Depth: 16-bit
-        - Streaming: 4KB chunks
+        Stream audio in real-time as it's being generated
         """
         try:
             logger.info(f"🔊 Generating TTS for ESP32 {client_id}: '{text[:50]}...'")
             
-            # Step 1: Generate Google TTS (returns MP3)
+            # Step 1: Start TTS generation
             mp3_audio = await self.voice_component.create_audio_response_async(text)
             
             if not mp3_audio or len(mp3_audio) < 100:
                 logger.error("❌ TTS generation failed")
-                await websocket.send_json({
-                    "type": "tts_error",
-                    "message": "TTS generation failed"
-                })
                 return
             
             logger.info(f"✅ Generated MP3: {len(mp3_audio)} bytes")
             
-            # Step 2: Convert MP3 to ESP32-compatible WAV
-            wav_audio = await self._convert_to_esp32_format(mp3_audio)
+            # Step 2: Convert to WAV
+            audio = AudioSegment.from_mp3(io.BytesIO(mp3_audio))
+            audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+            audio = audio.speedup(playback_speed=1.2)
             
-            if not wav_audio:
-                logger.error("❌ Audio conversion failed")
-                await websocket.send_json({
-                    "type": "tts_error",
-                    "message": "Audio conversion failed"
-                })
-                return
+            wav_buffer = io.BytesIO()
+            audio.export(wav_buffer, format="wav")
+            wav_buffer.seek(0)
+            wav_bytes = wav_buffer.getvalue()
             
-            logger.info(f"✅ Converted to WAV: {len(wav_audio)} bytes")
+            # Step 3: Stream and WAIT for completion
+            await self._stream_wav_to_esp32(wav_bytes, websocket, client_id)
             
-            # Step 3: Stream to ESP32
-            await self._stream_wav_to_esp32(wav_audio, websocket, client_id)
-            
-            logger.info(f"✅ Streaming complete for {client_id}")
+            logger.info(f"✅ Streaming started for {client_id}")
             
         except Exception as e:
             logger.error(f"❌ TTS streaming error: {e}", exc_info=True)
-            try:
-                await websocket.send_json({
-                    "type": "tts_error",
-                    "message": str(e)
-                })
-            except:
-                pass
-    
+
     async def _convert_to_esp32_format(self, mp3_bytes: bytes) -> Optional[bytes]:
         """
         Convert MP3 to ESP32-compatible WAV
@@ -104,65 +84,56 @@ class ESP32TTSStreamer:
             return None
     
     async def _stream_wav_to_esp32(self, wav_bytes: bytes, websocket: WebSocket, client_id: str):
-        """
-        Stream WAV data to ESP32 in chunks
-        
-        Protocol:
-        1. Send metadata (total size, format info)
-        2. Send audio chunks (4KB each)
-        3. Send completion signal
-        """
+        """Stream WAV audio to ESP32 in chunks with proper flow control"""
         try:
-            total_size = len(wav_bytes)
-            chunk_size = 4096  # 4KB chunks (good balance for ESP32)
+            # Parse WAV to get audio parameters
+            wav_io = io.BytesIO(wav_bytes)
+            with wave.open(wav_io, 'rb') as wf:
+                sample_rate = wf.getframerate()
+                channels = wf.getnchannels()
+                bits_per_sample = wf.getsampwidth() * 8
+                total_bytes = len(wav_bytes)
             
-            # Step 1: Send metadata
+            chunk_size = 4096
+            num_chunks = (total_bytes + chunk_size - 1) // chunk_size
+            
+            # Send stream start notification
             await websocket.send_json({
                 "type": "tts_start",
-                "total_bytes": total_size,
-                "sample_rate": 16000,
-                "channels": 1,
-                "bits_per_sample": 16,
-                "chunks": (total_size + chunk_size - 1) // chunk_size
+                "total_bytes": total_bytes,
+                "sample_rate": sample_rate,
+                "channels": channels,
+                "bits_per_sample": bits_per_sample,
+                "chunks": num_chunks
             })
             
-            logger.info(f"📤 Streaming {total_size} bytes in {chunk_size}-byte chunks")
+            logger.info(f"📤 Streaming {total_bytes} bytes in {chunk_size}-byte chunks")
             
-            # Step 2: Stream chunks
-            bytes_sent = 0
-            chunk_number = 0
-            
-            while bytes_sent < total_size:
-                # Extract chunk
-                chunk = wav_bytes[bytes_sent:bytes_sent + chunk_size]
-                
-                # Send as binary WebSocket message
+            # Stream chunks
+            for i in range(0, total_bytes, chunk_size):
+                chunk = wav_bytes[i:i + chunk_size]
                 await websocket.send_bytes(chunk)
                 
-                bytes_sent += len(chunk)
-                chunk_number += 1
+                if (i + chunk_size) % 40960 == 0:  # Log every ~40KB
+                    progress = ((i + chunk_size) * 100.0) / total_bytes
+                    logger.info(f"📊 Progress: {progress:.1f}% ({i + chunk_size}/{total_bytes} bytes)")
                 
-                # Log progress every 10 chunks
-                if chunk_number % 10 == 0:
-                    progress = (bytes_sent / total_size) * 100
-                    logger.info(f"📊 Progress: {progress:.1f}% ({bytes_sent}/{total_size} bytes)")
-                
-                # Small delay to prevent overwhelming ESP32
-                await asyncio.sleep(0.005)  # 5ms delay
+                await asyncio.sleep(0.01)  # Small delay between chunks
             
-            # Step 3: Send completion signal
+            await asyncio.sleep(0.03)
+
             await websocket.send_json({
                 "type": "tts_complete",
-                "total_bytes": bytes_sent,
-                "chunks_sent": chunk_number
+                "total_bytes": total_bytes,
+                "chunks_sent": num_chunks
             })
             
-            logger.info(f"✅ Sent {chunk_number} chunks, {bytes_sent} bytes total")
+            logger.info(f"✅ Sent {num_chunks} chunks, {total_bytes} bytes total")
             
         except Exception as e:
-            logger.error(f"❌ Streaming error: {e}")
+            logger.error(f"❌ Streaming error: {e}", exc_info=True)
             raise
-    
+        
     async def stream_text_chunks_to_esp32(self, text_stream, websocket: WebSocket, client_id: str):
         """
         Alternative: Stream text chunks and generate TTS per chunk

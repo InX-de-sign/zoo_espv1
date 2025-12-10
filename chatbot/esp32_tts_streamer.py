@@ -17,6 +17,45 @@ class ESP32TTSStreamer:
         self.voice_component = voice_component
         logger.info("✅ ESP32 TTS Streamer initialized")
     
+    async def stream_mp3_to_esp32(self, text: str, websocket: WebSocket, client_id: str):
+        """
+        ⚡ FASTEST: Stream MP3 directly as Edge TTS generates (NO CONVERSION!)
+        """
+        try:
+            logger.info(f"🚀 STREAMING MP3 to ESP32 {client_id}: '{text[:50]}...'")
+            
+            # Send stream start notification
+            await websocket.send_json({
+                "type": "tts_start",
+                "format": "mp3",
+                "text_length": len(text)
+            })
+            
+            total_bytes = 0
+            chunk_count = 0
+            
+            # Stream MP3 chunks as they generate
+            async for mp3_chunk in self.voice_component.stream_edge_tts_mp3(text):
+                await websocket.send_bytes(mp3_chunk)
+                total_bytes += len(mp3_chunk)
+                chunk_count += 1
+                
+                # Minimal delay for flow control (1ms instead of 10ms)
+                await asyncio.sleep(0.001)
+            
+            # Send completion signal
+            await websocket.send_json({
+                "type": "tts_complete",
+                "total_bytes": total_bytes,
+                "chunks_sent": chunk_count
+            })
+            
+            logger.info(f"✅ Streamed {chunk_count} MP3 chunks, {total_bytes} bytes")
+            
+        except Exception as e:
+            logger.error(f"❌ MP3 streaming error: {e}", exc_info=True)
+            raise
+    
     async def stream_response_to_esp32(self, text: str, websocket: WebSocket, client_id: str):
         """
         Stream audio in real-time as it's being generated
@@ -84,7 +123,7 @@ class ESP32TTSStreamer:
             return None
     
     async def _stream_wav_to_esp32(self, wav_bytes: bytes, websocket: WebSocket, client_id: str):
-        """Stream WAV audio to ESP32 in chunks with proper flow control"""
+        """Stream WAV audio to ESP32 in chunks with optimized flow control"""
         try:
             # Parse WAV to get audio parameters
             wav_io = io.BytesIO(wav_bytes)
@@ -94,7 +133,7 @@ class ESP32TTSStreamer:
                 bits_per_sample = wf.getsampwidth() * 8
                 total_bytes = len(wav_bytes)
             
-            chunk_size = 4096
+            chunk_size = 8192  # ⚡ Increased from 4096 to 8192
             num_chunks = (total_bytes + chunk_size - 1) // chunk_size
             
             # Send stream start notification
@@ -109,7 +148,7 @@ class ESP32TTSStreamer:
             
             logger.info(f"📤 Streaming {total_bytes} bytes in {chunk_size}-byte chunks")
             
-            # Stream chunks
+            # Stream chunks with minimal delay
             for i in range(0, total_bytes, chunk_size):
                 chunk = wav_bytes[i:i + chunk_size]
                 await websocket.send_bytes(chunk)
@@ -118,9 +157,10 @@ class ESP32TTSStreamer:
                     progress = ((i + chunk_size) * 100.0) / total_bytes
                     logger.info(f"📊 Progress: {progress:.1f}% ({i + chunk_size}/{total_bytes} bytes)")
                 
-                await asyncio.sleep(0.01)  # Small delay between chunks
+                # ⚡ Reduced from 0.01 to 0.001 (10x faster!)
+                await asyncio.sleep(0.001)
             
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.01)
 
             await websocket.send_json({
                 "type": "tts_complete",

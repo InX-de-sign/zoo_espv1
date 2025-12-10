@@ -145,40 +145,29 @@ class OptimizedVoiceComponent:
     def _create_gtts_sync(self, text: str) -> Optional[bytes]:
         """Synchronous Google TTS generation - FULL text"""
         try:
-            logger.info(f"🎙️ gTTS: Generating TTS for: '{text[:80]}...' ({len(text)} chars total)")
+            logger.debug(f"Generating TTS for: '{text[:50]}...' ({len(text)} chars total)")
             
             # Create Google TTS object with full text
             tts = gTTS(text=text, lang='en', slow=False)
-            logger.info(f"✅ gTTS object created successfully")
             
             # Save to temporary file
             temp_file = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
             temp_filename = temp_file.name
             temp_file.close()
-            logger.info(f"📁 Temp file created: {temp_filename}")
             
             try:
                 # Generate audio file
-                logger.info(f"💾 Saving gTTS to file...")
                 tts.save(temp_filename)
-                logger.info(f"✅ gTTS file saved")
                 
                 # Read the generated audio file
-                if os.path.exists(temp_filename):
-                    file_size = os.path.getsize(temp_filename)
-                    logger.info(f"📊 File size: {file_size} bytes")
+                if os.path.exists(temp_filename) and os.path.getsize(temp_filename) > 100:
+                    with open(temp_filename, 'rb') as audio_file:
+                        audio_data = audio_file.read()
                     
-                    if file_size > 100:
-                        with open(temp_filename, 'rb') as audio_file:
-                            audio_data = audio_file.read()
-                        
-                        logger.info(f"✅ TTS audio read: {len(audio_data)} bytes")
-                        return audio_data
-                    else:
-                        logger.error(f"❌ Google TTS file too small: {file_size} bytes")
-                        return None
+                    logger.debug(f"TTS file generated: {len(audio_data)} bytes")
+                    return audio_data
                 else:
-                    logger.error(f"❌ Google TTS file not found: {temp_filename}")
+                    logger.warning("Google TTS file not generated properly")
                     return None
                     
             finally:
@@ -186,12 +175,11 @@ class OptimizedVoiceComponent:
                 if os.path.exists(temp_filename):
                     try:
                         os.unlink(temp_filename)
-                        logger.debug(f"🧹 Cleaned up temp file")
-                    except Exception as cleanup_err:
-                        logger.warning(f"⚠️ Cleanup failed: {cleanup_err}")
+                    except:
+                        pass
                     
         except Exception as e:
-            logger.error(f"❌ Google TTS generation failed: {e}", exc_info=True)
+            logger.error(f"Google TTS generation failed: {e}")
             return None
 
     def create_audio_response(self, text: str, quick_test: bool = False) -> Optional[bytes]:

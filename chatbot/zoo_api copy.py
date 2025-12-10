@@ -2,11 +2,14 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
+from typing import Dict, Any
 from datetime import datetime 
 import asyncio
 import json
 import os
 import logging
+
+DEFAULT_CAMERA_ID = "esp32_robot_camera" 
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,6 +25,9 @@ from config import load_azure_openai_config
 from optimized_voice import OptimizedVoiceComponent
 from audio_receiver import AudioReceiver
 
+# Store recent detections for each user
+recent_detections: Dict[str, Dict[str, Any]] = {}
+
 # Initialize components
 openai_config = load_azure_openai_config()
 assistant = HybridZooAI(openai_api_key=openai_config.api_key, db_path="zoo.db")
@@ -30,8 +36,19 @@ voice_component = OptimizedVoiceComponent()
 # Initialize audio receiver with ESP32 support
 audio_receiver = AudioReceiver(
     voice_component=voice_component,
-    assistant=assistant
+    assistant=assistant,
+    recent_detections=recent_detections 
 )
+
+# Map camera IDs to audio client IDs
+CLIENT_ID_MAPPING = {
+    "esp32_robot_camera": "esp32_1",
+    "esp32_1": "esp32_1"
+}
+
+def get_mapped_id(client_id: str) -> str:
+    """Get the canonical ID for a client"""
+    return CLIENT_ID_MAPPING.get(client_id, client_id)
 
 # Mount static files
 if os.path.exists("static"):
@@ -62,10 +79,115 @@ async def root():
         </html>
         """)
 
+# Add this to zoo_api.py after the @app.get("/") endpoint
+
+from fastapi import Request
+
+@app.post("/cv/detection")
+async def receive_cv_detection(request: Request):
+    """
+    Receive animal detection from YOLO inference service
+    
+    Expected JSON:
+    {
+        "label": "capybara",
+        "user_id": "esp32_robot_camera", 
+        "confidence": 0.95
+    }
+    """
+    try:
+        data = await request.json()
+        label = data.get("label")
+        user_id = data.get("user_id", "default_user")
+        confidence = data.get("confidence", 0.0)
+        
+        # 🎯 MAP THE ID to canonical client_id
+        mapped_id = get_mapped_id(user_id)
+        
+        logger.info(f"🎯 CV Detection received: {label} ({confidence:.2f}) for user {user_id}")
+        if mapped_id != user_id:
+            logger.info(f"   📍 Mapped {user_id} → {mapped_id}")
+        
+        # Store detection with MAPPED ID
+        recent_detections[mapped_id] = {
+            "animal": label,
+            "confidence": confidence,
+            "timestamp": datetime.now().isoformat(),
+            "detected_at": datetime.now()
+        }
+        
+        # Optional: Automatically generate greeting about detected animal
+        greeting = f"Oh wow! I see you're looking at a {label}! "
+        
+        if label == "capybara":
+            greeting += "Capybaras are the world's largest rodents - they're like giant, chill hamsters!"
+        elif label == "panda":
+            greeting += "Giant pandas spend up to 14 hours a day eating bamboo!"
+        elif label == "red-panda":
+            greeting += "Red pandas are actually more related to raccoons than giant pandas!"
+        elif label == "sloth":
+            greeting += "Sloths move so slowly that algae grows on their fur!"
+        elif label == "penguin":
+            greeting += "Penguins can swim up to 22 miles per hour underwater!"
+        elif label == "arctic-fox":
+            greeting += "Arctic foxes have the warmest fur of any mammal!"
+        elif label == "harbor-seal":
+            greeting += "Harbor seals can hold their breath for up to 30 minutes!"
+        elif label == "parrot":
+            greeting += "Some parrots can live over 80 years!"
+        
+        logger.info(f"✅ Detection stored for {mapped_id}: {label}")
+        
+        return {
+            "status": "received",
+            "label": label,
+            "user_id": user_id,
+            "mapped_id": mapped_id,
+            "confidence": confidence,
+            "auto_greeting": greeting
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error receiving CV detection: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/cv/recent/{user_id}")
+async def get_recent_detection(user_id: str):
+    """Get the most recent CV detection for a user"""
+    detection = recent_detections.get(user_id)
+    
+    if detection:
+        # Check if detection is recent (within last 2 minutes)
+        detected_at = detection.get("detected_at")
+        if detected_at:
+            age_seconds = (datetime.now() - detected_at).total_seconds()
+            if age_seconds < 120:  # 2 minutes
+                return {
+                    "status": "found",
+                    "detection": detection,
+                    "age_seconds": age_seconds
+                }
+    
+    return {
+        "status": "no_recent_detection",
+        "user_id": user_id
+    }
+
+
+@app.get("/cv/detections")
+async def list_all_detections():
+    """List all recent detections across all users"""
+    return {
+        "total_users": len(recent_detections),
+        "detections": recent_detections
+    }
+
+# Replace the websocket endpoint in zoo_api.py with this enhanced version
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket for web-based real-time chat"""
-    await websocket.accept()
+    """WebSocket for web-based real-time chat WITH CV CONTEXT"""
+    await websocket.accept()  # ✅ Accept FIRST
     
     client_id = f"web_{hash(str(websocket.client))}_{int(asyncio.get_event_loop().time())}"[-10:]
     logger.info(f"🐼 Web client connected: {client_id}")
@@ -82,6 +204,7 @@ async def websocket_endpoint(websocket: WebSocket):
             
             if not message:
                 continue
+            
             logger.info(f"Query from {client_id}: {message}")
             
             await websocket.send_json({
@@ -90,11 +213,30 @@ async def websocket_endpoint(websocket: WebSocket):
             })
             
             try:
-                response = await assistant.process_message(message, client_id)
+                # 🎯 CHECK FOR RECENT CV DETECTION
+                # Use the DEFAULT_CAMERA_ID since web clients don't have their own camera
+                cv_detected_animal = None
+                if DEFAULT_CAMERA_ID in recent_detections:
+                    detection = recent_detections[DEFAULT_CAMERA_ID]
+                    detected_at = detection.get("detected_at")
+                    
+                    if detected_at:
+                        age_seconds = (datetime.now() - detected_at).total_seconds()
+                        if age_seconds < 120:  # Detection within last 2 minutes
+                            cv_detected_animal = detection.get("animal")
+                            logger.info(f"🎯 Using CV context: {cv_detected_animal} (detected {age_seconds:.0f}s ago)")
+                
+                # Process with CV context
+                response = await assistant.process_message(
+                    message, 
+                    client_id,
+                    cv_detected_animal=cv_detected_animal  # Pass CV detection
+                )
                 
                 await websocket.send_json({
                     "type": "response",
-                    "message": response
+                    "message": response,
+                    "cv_detected": cv_detected_animal  # Include in response
                 })
                 
             except Exception as e:
@@ -112,24 +254,9 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.websocket("/ws/esp32/audio/{client_id}")
 async def esp32_audio_endpoint(websocket: WebSocket, client_id: str):
     """
-    🆕 ESP32 Audio WebSocket - COMPLETE WORKFLOW
+    🆕 ESP32 Audio WebSocket WITH CV CONTEXT
     
-    This endpoint handles:
-    1. Receives audio chunks from ESP32
-    2. Transcribes with Google STT
-    3. Processes with OpenAI
-    4. Generates Google TTS
-    5. Converts to ESP32 format (16kHz WAV)
-    6. Streams audio back to ESP32
-    
-    Protocol:
-    - ESP32 sends: {"type": "register", "audio_settings": {...}}
-    - ESP32 sends: {"type": "audio_chunk", "audio": "base64...", "chunk_id": 0}
-    - ESP32 sends: {"type": "audio_complete", "total_chunks": 100}
-    - Server sends: {"type": "stt_result", "text": "..."}
-    - Server sends: {"type": "tts_start", "total_bytes": 50000, ...}
-    - Server sends: binary audio chunks
-    - Server sends: {"type": "tts_complete", "total_bytes": 50000}
+    Now includes animal detection context when processing queries
     """
     await websocket.accept()
     logger.info(f"🎤 ESP32 audio client connected: {client_id}")
@@ -139,24 +266,38 @@ async def esp32_audio_endpoint(websocket: WebSocket, client_id: str):
     )
 
     try:
-        # Wait for registration
         first_message = await websocket.receive_json()
         
-        # Handle with audio receiver (supports complete workflow)
-        await audio_receiver.handle_client_with_id(websocket, client_id, first_message)
+        # 🎯 CHECK FOR RECENT CV DETECTION BEFORE PROCESSING
+        cv_detected_animal = None
+        if client_id in recent_detections:
+            detection = recent_detections[client_id]
+            detected_at = detection.get("detected_at")
+            
+            if detected_at:
+                age_seconds = (datetime.now() - detected_at).total_seconds()
+                if age_seconds < 120:  # Detection within last 2 minutes
+                    cv_detected_animal = detection.get("animal")
+                    logger.info(f"🎯 ESP32 using CV context: {cv_detected_animal} (detected {age_seconds:.0f}s ago)")
+        
+        # Pass CV context to audio receiver
+        await audio_receiver.handle_client_with_id(
+            websocket, 
+            client_id, 
+            first_message,
+            cv_detected_animal=cv_detected_animal  # ✅ PASS CV CONTEXT
+        )
         
     except WebSocketDisconnect:
         logger.info(f"🔌 ESP32 disconnected: {client_id}")
     except Exception as e:
         logger.error(f"❌ ESP32 error: {e}", exc_info=True)
     finally:
-        # ✅ Cancel keepalive task
         keepalive_task.cancel()
         try:
             await keepalive_task
         except asyncio.CancelledError:
             pass
-
 
 async def send_keepalive_pings(websocket: WebSocket, client_id: str):
     """Send periodic pings to keep connection alive"""

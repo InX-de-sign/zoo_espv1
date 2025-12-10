@@ -238,6 +238,7 @@ class AudioReceiver:
                     break
                 
                 msg_type = message.get("type")
+                logger.info(f"📨 Received message type: {msg_type} from {client_id}")  # 🆕 Added logging
                 
                 if msg_type == "audio_chunk":
                     # ORIGINAL PROTOCOL: audio field contains base64
@@ -251,17 +252,22 @@ class AudioReceiver:
                                 self.audio_queues[client_id] = deque(maxlen=100)
                             
                             self.audio_queues[client_id].append(audio_bytes)
-                            logger.debug(f"📥 Queued chunk: {len(audio_bytes)} bytes")
+                            logger.info(f"📥 Queued audio chunk: {len(audio_bytes)} bytes (total chunks: {len(self.audio_queues[client_id])})")  # 🆕 Changed to info
                             
                         except Exception as e:
                             logger.error(f"❌ Decode error: {e}")
+                    else:
+                        logger.warning(f"⚠️ audio_chunk message has no 'audio' field")  # 🆕 Added warning
                 
                 elif msg_type == "audio_complete":
                     logger.info(f"🎵 Audio complete signal from {client_id}")
                     
                     if client_id in self.audio_queues:
+                        chunks_count = len([x for x in self.audio_queues[client_id] if isinstance(x, bytes)])
+                        logger.info(f"✅ Queued complete signal ({chunks_count} audio chunks received)")  # 🆕 Show chunk count
                         self.audio_queues[client_id].append("COMPLETE")
-                        logger.info(f"✅ Queued complete signal")
+                    else:
+                        logger.warning(f"⚠️ Received complete signal but no audio queue for {client_id}")  # 🆕 Added warning
                 
                 elif msg_type == "settings":
                     self.client_settings[client_id] = {
@@ -272,7 +278,7 @@ class AudioReceiver:
                     logger.info(f"📊 Updated settings for {client_id}")
                 
                 else:
-                    logger.debug(f"Unknown message type: {msg_type}")
+                    logger.warning(f"⚠️ Unknown message type: {msg_type} - Full message: {message}")  # 🆕 Changed to warning with full message
                     
         except Exception as e:
             logger.error(f"❌ Stream error: {e}", exc_info=True)
@@ -280,8 +286,10 @@ class AudioReceiver:
             logger.info(f"🧹 Stream cleanup for {client_id}")
                                                         
     async def _process_audio_queue(self, client_id: str, websocket):
-        """Process audio chunks → STT → OpenAI → TTS → Stream"""
+        """⚡ OPTIMIZED: Process audio chunks → STT → OpenAI → TTS → Stream
+        Now with early processing - starts STT as soon as first chunk arrives!"""
         audio_chunks = []
+        first_chunk_received = False
         
         logger.info(f"🔄 Audio processing task STARTED for {client_id}")
 
@@ -296,6 +304,18 @@ class AudioReceiver:
                     continue
                 
                 item = self.audio_queues[client_id].popleft()
+                
+                # ⚡ OPTIMIZATION: Track first chunk for early processing
+                if isinstance(item, bytes) and not first_chunk_received:
+                    first_chunk_received = True
+                    logger.info(f"🚀 First audio chunk received - preparing for STT")
+                    try:
+                        await websocket.send_json({
+                            "type": "audio_receiving",
+                            "message": "Listening..."
+                        })
+                    except:
+                        pass
 
                 if item == "COMPLETE":
                     if len(audio_chunks) > 0:
@@ -376,7 +396,7 @@ class AudioReceiver:
                 await asyncio.sleep(0.1)
                             
     async def _process_with_openai_and_stream(self, text: str, client_id: str, websocket, cv_detected_animal: Optional[str] = None):        
-        """Process with OpenAI and stream TTS responses"""
+        """Process with OpenAI and stream TTS responses with parallel MP3 generation"""
         if not self.assistant:
             logger.warning("⚠️ Assistant not configured")
             return
@@ -393,23 +413,30 @@ class AudioReceiver:
                 "message": "Getting AI response..."
             })
 
-            phrases = []
             word_buffer = ""
             MIN_WORDS = 8
             MAX_WORDS = 20
+            
+            # ⚡ Queue for parallel TTS generation
+            tts_tasks = []
+            phrase_count = 0
                         
-            # Collect phrases
+            # Stream and generate TTS in parallel as phrases arrive
             async for text_chunk in self.assistant.stream_message(text, client_id, cv_detected_animal):
                 word_buffer += text_chunk
                 current_words = len(word_buffer.split())
                 
                 has_strong_ending = any(punct in word_buffer for punct in ['.', '!', '?'])
                 
+                # Start TTS generation immediately when we have a complete phrase
                 if has_strong_ending and current_words >= MIN_WORDS:
                     phrase = word_buffer.strip()
-                    if phrase:
-                        phrases.append(phrase)
-                        logger.info(f"📝 Phrase {len(phrases)}: {phrase[:50]}...")
+                    if phrase and len(phrase) > 5:
+                        phrase_count += 1
+                        logger.info(f"📝 Phrase {phrase_count}: {phrase[:50]}...")
+                        # ⚡ Start generating MP3 immediately in parallel
+                        task = asyncio.create_task(self._generate_and_queue_mp3(phrase, phrase_count))
+                        tts_tasks.append(task)
                     word_buffer = ""
                     
                 elif current_words >= MAX_WORDS:
@@ -422,47 +449,99 @@ class AudioReceiver:
                     
                     if best_break > 0:
                         phrase = word_buffer[:best_break + 1].strip()
-                        if phrase:
-                            phrases.append(phrase)
-                            logger.info(f"📝 Phrase {len(phrases)}: {phrase[:50]}...")
+                        if phrase and len(phrase) > 5:
+                            phrase_count += 1
+                            logger.info(f"📝 Phrase {phrase_count}: {phrase[:50]}...")
+                            # ⚡ Start generating MP3 immediately in parallel
+                            task = asyncio.create_task(self._generate_and_queue_mp3(phrase, phrase_count))
+                            tts_tasks.append(task)
                         word_buffer = word_buffer[best_break + 1:].strip()
             
-            if word_buffer.strip():
-                phrases.append(word_buffer.strip())
-                logger.info(f"📝 Final phrase: {word_buffer.strip()[:50]}...")
+            # Handle remaining text
+            if word_buffer.strip() and len(word_buffer.strip()) > 5:
+                phrase_count += 1
+                logger.info(f"📝 Final phrase {phrase_count}: {word_buffer.strip()[:50]}...")
+                task = asyncio.create_task(self._generate_and_queue_mp3(word_buffer.strip(), phrase_count))
+                tts_tasks.append(task)
             
-            logger.info(f"✅ Collected {len(phrases)} phrases")
-            phrases = [p for p in phrases if len(p) > 5]
+            logger.info(f"✅ Collected {phrase_count} phrases, waiting for TTS generation...")
             
-            # Generate and stream TTS
-            for idx, phrase in enumerate(phrases):
-                logger.info(f"🎵 [{idx+1}/{len(phrases)}] TTS: {phrase[:50]}...")
+            # Wait for all MP3 generation to complete
+            mp3_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
+            
+            # Stream MP3s in order
+            for idx, result in enumerate(mp3_results):
+                if isinstance(result, Exception):
+                    logger.error(f"❌ Phrase {idx+1} TTS failed: {result}")
+                    continue
+                
+                if not isinstance(result, tuple):
+                    logger.error(f"❌ Phrase {idx+1} returned invalid result")
+                    continue
+                    
+                phrase_num, mp3_audio = result
+                
+                if not mp3_audio or len(mp3_audio) < 100:
+                    logger.error(f"❌ Phrase {phrase_num} TTS produced empty audio")
+                    continue
                 
                 try:
-                    mp3_audio = await self.voice_component.create_audio_response_async(phrase)
+                    # Stream MP3 directly (no conversion!)
+                    logger.info(f"📤 [{phrase_num}/{phrase_count}] Streaming {len(mp3_audio)} bytes MP3")
                     
-                    if not mp3_audio or len(mp3_audio) < 100:
-                        logger.error(f"❌ TTS failed")
-                        continue
+                    chunk_size = 4096
+                    await websocket.send_json({
+                        "type": "audio_start",
+                        "format": "mp3",
+                        "total_bytes": len(mp3_audio),
+                        "phrase": phrase_num,
+                        "total_phrases": phrase_count
+                    })
                     
-                    audio = AudioSegment.from_mp3(io.BytesIO(mp3_audio))
-                    audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-                    audio = audio.speedup(playback_speed=1.1)
+                    # Stream MP3 chunks
+                    for i in range(0, len(mp3_audio), chunk_size):
+                        chunk = mp3_audio[i:i + chunk_size]
+                        await websocket.send_bytes(chunk)
+                        await asyncio.sleep(0.001)
                     
-                    wav_buffer = io.BytesIO()
-                    audio.export(wav_buffer, format="wav")
-                    wav_bytes = wav_buffer.getvalue()
+                    await websocket.send_json({
+                        "type": "audio_complete",
+                        "phrase": phrase_num
+                    })
                     
-                    await self.esp32_streamer._stream_wav_to_esp32(wav_bytes, websocket, client_id)
-                    logger.info(f"✅ [{idx+1}/{len(phrases)}] Streamed")
+                    logger.info(f"✅ [{phrase_num}/{phrase_count}] Streamed")
                     
                 except Exception as e:
-                    logger.error(f"❌ Error: {e}")
+                    logger.error(f"❌ Phrase {phrase_num} streaming error: {e}")
 
             logger.info(f"✅ All phrases streamed")
                         
         except Exception as e:
             logger.error(f"❌ OpenAI error: {e}", exc_info=True)
+    
+    async def _generate_and_queue_mp3(self, phrase: str, phrase_num: int) -> tuple:
+        """Generate MP3 for a phrase (runs in parallel)"""
+        try:
+            logger.info(f"🎵 [{phrase_num}] Starting TTS generation...")
+            mp3_audio = await self.voice_component.create_audio_response_async(phrase)
+            logger.info(f"✅ [{phrase_num}] TTS complete: {len(mp3_audio) if mp3_audio else 0} bytes")
+            return (phrase_num, mp3_audio)
+        except Exception as e:
+            logger.error(f"❌ [{phrase_num}] TTS error: {e}")
+            return (phrase_num, None)
+    
+    async def _stream_single_phrase_mp3(self, phrase: str, idx: int, total: int, websocket, client_id: str):
+        """⚡ Stream a single phrase using direct MP3 streaming (NO CONVERSION!)"""
+        try:
+            logger.info(f"🎵 [{idx+1}/{total}] Starting MP3 stream: {phrase[:50]}...")
+            
+            # ⚡ Use new streaming MP3 method - streams as TTS generates!
+            await self.esp32_streamer.stream_mp3_to_esp32(phrase, websocket, client_id)
+            
+            logger.info(f"✅ [{idx+1}/{total}] Phrase streamed")
+            
+        except Exception as e:
+            logger.error(f"❌ [{idx+1}/{total}] Streaming error: {e}")
                 
     def _combine_to_proper_wav(self, chunks: list, client_id: str) -> Optional[bytes]:
         """Combine audio chunks - handles mixed WAV/raw format"""

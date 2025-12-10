@@ -4,7 +4,7 @@ import os
 import sqlite3
 import logging
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, AsyncGenerator
 import asyncio
 from config import load_azure_openai_config
 
@@ -26,12 +26,16 @@ class EnhancedRAGWithOpenAI:
             api_version=self.config.api_version,
             azure_endpoint=self.config.azure_endpoint
         )
+
+        from streaming_openai import StreamingOpenAI
+        self.streaming_openai = StreamingOpenAI()
         
         self.openai_available = True
         logger.info("Azure OpenAI client initialized")
 
         # Database path
         self.db_path = db_path or self._find_database()
+
 
         # Animal name patterns for better matching
         self.animal_patterns = {
@@ -98,7 +102,15 @@ class EnhancedRAGWithOpenAI:
                     "Arctic foxes have adaptations for cold weather including thick fur." NO""",
             
             
-            'park_info': """You are a helpful zoo guide of the Hong Kong Ocean Park. Give clear, friendly directions. Keep it to 1-2 sentences. Use landmarks.""",
+            'park_info': """
+                You are a helpful zoo guide of the Hong Kong Ocean Park. 
+                Give clear, friendly directions. Use simple language.
+                CRITICAL RULES:
+                    - EXACTLY ONE sentence ONLY (15-20 words maximum)
+                    - NEVER use emojis or Unicode symbols
+                STYLE: 
+                    Ms. Frizzle from  the Magic School Bus explaining something fascinating - clear, exciting, relatable comparisons.
+                """,
         }
 
         # Test OpenAI connection
@@ -231,6 +243,15 @@ class EnhancedRAGWithOpenAI:
                 response_parts.append(f"You can visit them at {location}!")
             
             return " ".join(response_parts)
+    
+    async def stream_query_with_openai(self, query: str, context: Dict[str, Any], user_id: str) -> AsyncGenerator[str, None]:
+        """Stream OpenAI response for real-time TTS"""
+        try:
+            async for chunk in self.streaming_openai.stream_response(query, context):
+                yield chunk
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            yield "Let me tell you something amazing!"
 
     async def process_query_with_openai(self, query: str, context: Dict[str, Any], user_id: str) -> str:
         """Process query using OpenAI with full context"""
@@ -290,23 +311,33 @@ class EnhancedRAGWithOpenAI:
         """Wrapper for backward compatibility"""
         return await self.process_query_with_openai(query, context or {}, user_id)
 
+
     def _build_enhanced_prompt(self, query: str, context: Dict[str, Any]) -> str:
-        """Build comprehensive prompt with all available context"""
+        """Build comprehensive prompt with CV DETECTION as TOP PRIORITY"""
         prompt_parts = []
 
+        # 🎯 CRITICAL: CV DETECTION CONTEXT FIRST (HIGHEST PRIORITY)
         try:
-            # Add CV detection context if available
-            if context.get('cv_detected') and context.get('detected_animal'):
-                detected_animal = context.get('detected_animal')
-                prompt_parts.append("IMPORTANT CONTEXT:")
-                prompt_parts.append(f"The visitor is currently viewing: {detected_animal}")
-                prompt_parts.append("Always refer to THIS animal when they say 'this one', 'this animal', 'this', 'them' or ask about details.")
+            detected_animal = context.get('detected_animal')
+            if detected_animal and isinstance(detected_animal, str) and detected_animal.strip():
+                prompt_parts.append("=" * 60)
+                prompt_parts.append("⚠️ CRITICAL CURRENT CONTEXT - READ THIS FIRST ⚠️")
+                prompt_parts.append("=" * 60)
+                prompt_parts.append(f"THE VISITOR IS CURRENTLY LOOKING AT: {detected_animal.upper()}")
+                prompt_parts.append("")
+                prompt_parts.append("IMPORTANT RULES:")
+                prompt_parts.append(f"- When they ask 'what animal am I looking at?', they mean: {detected_animal}")
+                prompt_parts.append(f"- When they say 'this one', 'this animal', 'this', 'them', they mean: {detected_animal}")
+                prompt_parts.append(f"- When they ask 'what is it?', they mean: {detected_animal}")
+                prompt_parts.append(f"- IGNORE any previous animals mentioned in conversation history")
+                prompt_parts.append(f"- The ONLY animal that matters right now is: {detected_animal}")
+                prompt_parts.append("=" * 60)
                 prompt_parts.append("")
         except Exception as e:
-            logger.debug(f"CV context error: {e}")
+            logger.debug(f"Detected animal error: {e}")
 
+        # Add local database context
         try:
-            # Add local database context
             local_db = context.get('local_database') if context else None
             if local_db and isinstance(local_db, str) and local_db.strip():
                 prompt_parts.append("ZOO ANIMAL DATABASE:")
@@ -315,8 +346,8 @@ class EnhancedRAGWithOpenAI:
         except Exception as e:
             logger.debug(f"Local database context error: {e}")
         
+        # Add user context (preferences)
         try:
-            # Add user context
             user_context = context.get('user_context') if context else None
             if user_context and isinstance(user_context, str) and user_context.strip():
                 prompt_parts.append("VISITOR PREFERENCES:")
@@ -324,39 +355,30 @@ class EnhancedRAGWithOpenAI:
                 prompt_parts.append("")
         except Exception as e:
             logger.debug(f"User context error: {e}")
-        
-        try:
-            # Add detected animal focus
-            detected_animal = context.get('detected_animal') if context else None
-            if detected_animal and isinstance(detected_animal, str) and detected_animal.strip():
-                prompt_parts.append(f"PRIMARY FOCUS: {detected_animal}")
-                prompt_parts.append("")
-        except Exception as e:
-            logger.debug(f"Detected animal error: {e}")
 
+        # Add conversation history LAST (lowest priority)
         try:
-            # Add conversation history
             conversation_history = context.get('conversation_history', []) if context else []
             if conversation_history and len(conversation_history) > 0:
-                prompt_parts.append("RECENT CONVERSATION:")
-                for i, prev_msg in enumerate(conversation_history[-3:], 1):  # Last 3 messages
+                prompt_parts.append("PREVIOUS CONVERSATION (FOR REFERENCE ONLY):")
+                prompt_parts.append("⚠️ NOTE: This history may mention OTHER animals. Ignore them if CV detection shows a different animal.")
+                for i, prev_msg in enumerate(conversation_history[-3:], 1):
                     if isinstance(prev_msg, str) and prev_msg.strip():
                         prompt_parts.append(f"  {i}. Visitor asked: {prev_msg}")
                 prompt_parts.append("")
-                prompt_parts.append("IMPORTANT: Use this conversation history to understand context and pronouns like 'they', 'them', 'those animals'.")
-                prompt_parts.append("")
         except Exception as e:
             logger.debug(f"Conversation history error: {e}")
-    
         
-        # Add the actual user query
+        # Add the actual user query AFTER context
         if query and isinstance(query, str):
-            prompt_parts.append("VISITOR QUESTION:")
+            prompt_parts.append("=" * 60)
+            prompt_parts.append("CURRENT VISITOR QUESTION:")
             prompt_parts.append(query)
+            prompt_parts.append("=" * 60)
             prompt_parts.append("")
         
         return "\n".join(prompt_parts) if prompt_parts else f"VISITOR QUESTION: {query}"
-
+        
     async def _call_openai_api(self, system_prompt: str, user_prompt: str) -> Optional[str]:
         """Call OpenAI API with error handling"""
         try:

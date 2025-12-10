@@ -116,7 +116,6 @@ async def receive_cv_detection(request: Request):
             "detected_at": datetime.now()
         }
         
-        # Optional: Automatically generate greeting about detected animal
         greeting = f"Oh wow! I see you're looking at a {label}! "
         
         if label == "capybara":

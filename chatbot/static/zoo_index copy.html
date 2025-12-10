@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Ocean Park Zoo Guide</title>
+    <style>
+        body {
+            font-family: 'Arial', sans-serif;
+            margin: 0;
+            padding: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            justify-content: center;
+            height: 100vh;
+        }
+
+        .chat-container {
+            width: 100%;
+            max-width: 800px;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            background-color: white;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.3);
+        }
+
+        h1 {
+            text-align: center;
+            padding: 20px;
+            margin: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .audio-control {
+            padding: 10px;
+            text-align: center;
+            background-color: #f0f0f0;
+            border-bottom: 1px solid #ddd;
+        }
+
+        .audio-control button {
+            padding: 8px 16px;
+            background-color: #667eea;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+
+        .audio-control button.audio-enabled {
+            background-color: #4caf50;
+        }
+
+        .messages {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            background-color: #f5f5f5;
+        }
+
+        .message {
+            max-width: 70%;
+            padding: 12px 16px;
+            border-radius: 18px;
+            line-height: 1.4;
+        }
+
+        .user-message {
+            align-self: flex-end;
+            background-color: #e3f2fd;
+            color: #1565c0;
+            border-bottom-right-radius: 4px;
+        }
+
+        .bot-message {
+            align-self: flex-start;
+            background-color: #f3e5f5;
+            color: #7b1fa2;
+            border-bottom-left-radius: 4px;
+        }
+
+        .welcome-message {
+            align-self: flex-start;
+            background-color: #e8f5e8;
+            color: #2e7d32;
+            border-bottom-left-radius: 4px;
+        }
+
+        .system-message {
+            align-self: center;
+            background-color: #95a5a6a6;
+            color: white;
+            font-size: 0.9em;
+            padding: 8px 12px;
+        }
+
+        .input-area {
+            display: flex;
+            padding: 15px;
+            background-color: #f9f9f9;
+            border-top: 1px solid #ddd;
+            gap: 10px;
+        }
+
+        #textInput {
+            flex: 1;
+            padding: 12px 15px;
+            border: 1px solid #ddd;
+            border-radius: 24px;
+            outline: none;
+            font-size: 16px;
+        }
+
+        button {
+            padding: 12px 20px;
+            background-color: #667eea;
+            color: white;
+            border: none;
+            border-radius: 24px;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background-color: #5568d3;
+        }
+
+        .quick-questions {
+            padding: 10px 15px;
+            background-color: #fafafa;
+            border-bottom: 1px solid #ddd;
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .quick-btn {
+            padding: 6px 12px;
+            background-color: white;
+            border: 2px solid #667eea;
+            border-radius: 15px;
+            color: #667eea;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+        .quick-btn:hover {
+            background-color: #667eea;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <h1>🐼 Ocean Park Zoo Guide</h1>
+
+        <div class="audio-control">
+            <button id="audioToggle" onclick="toggleAudio()">Enable Audio 🔊</button>
+            <span id="audioStatus">Audio: OFF</span>
+        </div>
+
+        <div class="quick-questions">
+            <button class="quick-btn" onclick="testMessage('Tell me about capybaras')">🦫 Capybara</button>
+            <button class="quick-btn" onclick="testMessage('Where are the pandas?')">🐼 Pandas</button>
+            <button class="quick-btn" onclick="testMessage('What do penguins eat?')">🐧 Penguins</button>
+            <button class="quick-btn" onclick="testMessage('Tell me about sloths')">🦥 Sloths</button>
+        </div>
+
+        <div class="messages" id="messages"></div>
+
+        <div class="input-area">
+            <input type="text" id="textInput" placeholder="Ask about any animal..." onkeypress="if(event.key==='Enter') sendMessage()">
+            <button onclick="sendMessage()">Send 🐾</button>
+            <button id="recordButton" onclick="toggleRecording()">🎤</button>
+        </div>
+    </div>
+
+    <script>
+        let ws;
+        let audioEnabled = false;
+        let isRecording = false;
+        let messageQueue = [];
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+
+        // Audio variables
+        let audioContext = null;
+        let audioQueue = [];
+        let isPlayingAudio = false;
+        let currentAudioElement = null;
+
+        // Browser TTS variables
+        let ttsQueue = [];
+        let isTTSPlaying = false;
+        let selectedVoice = null;
+        let voicesLoaded = false;
+        let hasUserInteracted = false;
+        let currentResponseId = null;
+
+        function initAudioContext() {
+            if (!audioContext) {
+                try {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    console.log('Audio context initialized');
+                } catch (e) {
+                    console.error('Audio context creation failed:', e);
+                }
+            }
+        }
+
+        function initializeTTSVoice() {
+            if (!('speechSynthesis' in window)) {
+                console.warn('Speech synthesis not supported');
+                return;
+            }
+
+            function loadVoices() {
+                const voices = speechSynthesis.getVoices();
+                console.log('Available voices:', voices.map(v => `${v.name} (${v.lang})`));
+
+                if (voices.length === 0) return;
+
+                const voicePreferences = [
+                    v => v.lang.startsWith('en') && v.name.toLowerCase().includes('female'),
+                    v => v.lang.startsWith('en') && v.name.toLowerCase().includes('samantha'),
+                    v => v.lang.startsWith('en') && v.name.toLowerCase().includes('google'),
+                    v => v.lang.startsWith('en-US'),
+                    v => v.lang.startsWith('en'),
+                    v => v.default,
+                    v => true
+                ];
+
+                for (const preference of voicePreferences) {
+                    selectedVoice = voices.find(preference);
+                    if (selectedVoice) {
+                        console.log(`Selected TTS voice: ${selectedVoice.name}`);
+                        voicesLoaded = true;
+                        return;
+                    }
+                }
+
+                if (voices.length > 0) {
+                    selectedVoice = voices[0];
+                    voicesLoaded = true;
+                }
+            }
+
+            loadVoices();
+            if (!voicesLoaded) {
+                speechSynthesis.onvoiceschanged = function () {
+                    if (!voicesLoaded) loadVoices();
+                };
+            }
+        }
+
+        function playBrowserTTS(text, sentenceNumber, responseId = null) {
+            if (!text || !text.trim()) return;
+
+            try {
+                if (!('speechSynthesis' in window)) return;
+
+                ttsQueue.push({
+                    text: text.trim(),
+                    sentenceNumber: sentenceNumber,
+                    responseId: responseId || Date.now()
+                });
+
+                console.log(`Added to TTS queue: sentence ${sentenceNumber}`);
+
+                if (!isTTSPlaying) {
+                    playNextTTS();
+                }
+            } catch (error) {
+                console.error('Browser TTS failed:', error);
+            }
+        }
+
+        function playNextTTS() {
+            if (ttsQueue.length === 0) {
+                isTTSPlaying = false;
+                return;
+            }
+
+            isTTSPlaying = true;
+            const ttsItem = ttsQueue.shift();
+
+            try {
+                const utterance = new SpeechSynthesisUtterance(ttsItem.text);
+
+                if (selectedVoice) {
+                    utterance.voice = selectedVoice;
+                }
+
+                utterance.rate = 0.9;
+                utterance.pitch = 1.1;
+                utterance.volume = 0.8;
+
+                utterance.onend = function () {
+                    setTimeout(() => playNextTTS(), 200);
+                };
+
+                utterance.onerror = function () {
+                    setTimeout(() => playNextTTS(), 100);
+                };
+
+                speechSynthesis.speak(utterance);
+            } catch (error) {
+                setTimeout(() => playNextTTS(), 100);
+            }
+        }
+
+        function clearTTSQueue() {
+            ttsQueue = [];
+            speechSynthesis.cancel();
+            isTTSPlaying = false;
+        }
+
+        async function playServerAudio(audioBlob) {
+            try {
+                // Stop any current audio
+                if (currentAudioElement) {
+                    currentAudioElement.pause();
+                    currentAudioElement = null;
+                }
+                clearTTSQueue();
+
+                // Create audio element from MP3 blob
+                const audioUrl = URL.createObjectURL(audioBlob);
+                const audio = new Audio(audioUrl);
+                currentAudioElement = audio;
+
+                audio.onended = function() {
+                    URL.revokeObjectURL(audioUrl);
+                    currentAudioElement = null;
+                    console.log('✅ Server audio playback complete');
+                };
+
+                audio.onerror = function(e) {
+                    console.error('❌ Audio playback error:', e);
+                    URL.revokeObjectURL(audioUrl);
+                    currentAudioElement = null;
+                };
+
+                await audio.play();
+                console.log('🔊 Playing server Edge TTS (Ana voice)');
+            } catch (error) {
+                console.error('Server audio playback failed:', error);
+                currentAudioElement = null;
+            }
+        }
+
+        function toggleAudio() {
+            if (!audioEnabled) {
+                initAudioContext();
+                initializeTTSVoice();
+                audioEnabled = true;
+
+                document.getElementById('audioToggle').textContent = 'Disable Audio 🔇';
+                document.getElementById('audioToggle').classList.add('audio-enabled');
+                document.getElementById('audioStatus').textContent = 'Audio: ON';
+                addMessage('Audio enabled! 🎵', 'system');
+            } else {
+                audioEnabled = false;
+                clearTTSQueue();
+
+                document.getElementById('audioToggle').textContent = 'Enable Audio 🔊';
+                document.getElementById('audioToggle').classList.remove('audio-enabled');
+                document.getElementById('audioStatus').textContent = 'Audio: OFF';
+                addMessage('Audio disabled.', 'system');
+            }
+        }
+
+        function initWebSocket() {
+            // ws = new WebSocket('ws://localhost:9001/ws');
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            // const ws = new WebSocket(wsUrl);
+
+            console.log('Connecting to WebSocket:', wsUrl);
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = function () {
+                console.log('Connected to zoo chatbot');
+                addMessage('Connected to zoo guide! 🐼', 'system');
+                reconnectAttempts = 0;
+
+                while (messageQueue.length > 0) {
+                    ws.send(messageQueue.shift());
+                }
+            };
+
+            ws.onmessage = async function (event) {
+                try {
+                    // Check if it's binary data (MP3 audio from server)
+                    if (event.data instanceof Blob) {
+                        if (audioEnabled) {
+                            console.log('Received MP3 audio chunk:', event.data.size, 'bytes');
+                            await playServerAudio(event.data);
+                        }
+                        return;
+                    }
+
+                    const data = JSON.parse(event.data);
+                    console.log('Received:', data);
+
+                    if (!hasUserInteracted) {
+                        hasUserInteracted = true;
+                        initializeTTSVoice();
+                    }
+
+                    if (data.type === "system") {
+                        addMessage(data.message, 'welcome');
+                    } else if (data.type === "thinking") {
+                        addMessage(data.message, 'system');
+                    } else if (data.type === "response") {
+                        addMessage(data.message, 'bot');
+                        
+                        // Note: Server will send audio separately if enabled
+                        // Fallback to browser TTS if server audio fails
+                        if (audioEnabled && !currentAudioElement) {
+                            setTimeout(() => {
+                                if (!currentAudioElement) {
+                                    console.log('Using fallback browser TTS');
+                                    playBrowserTTS(data.message, 1);
+                                }
+                            }, 500);
+                        }
+                    } else if (data.type === "audio_complete") {
+                        console.log('✅ Server audio complete:', data.bytes, 'bytes');
+                    }
+                } catch (error) {
+                    console.error('Message processing error:', error);
+                }
+            };
+
+            ws.onclose = function () {
+                console.log('WebSocket closed');
+
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    addMessage(`Reconnecting... (${reconnectAttempts})`, 'system');
+                    setTimeout(initWebSocket, 2000 * reconnectAttempts);
+                }
+            };
+
+            ws.onerror = function (error) {
+                console.error('WebSocket error:', error);
+                addMessage('Connection error. Check console for details.', 'system');
+            };
+        }
+
+        // Initialize on load
+        window.onload = function () {
+            console.log('Page loaded, initializing WebSocket...');
+            console.log('Current URL:', window.location.href);
+            console.log('Protocol:', window.location.protocol);
+            console.log('Host:', window.location.host);
+            initWebSocket();
+        };
+
+        function addMessage(text, sender) {
+            const messages = document.getElementById('messages');
+            const messageElement = document.createElement('div');
+            messageElement.classList.add('message', `${sender}-message`);
+            messageElement.textContent = text;
+            messages.appendChild(messageElement);
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        function testMessage(message) {
+            document.getElementById('textInput').value = message;
+            sendMessage();
+        }
+
+        function sendMessage() {
+            const input = document.getElementById('textInput');
+            const message = input.value.trim();
+
+            if (message) {
+                addMessage(message, 'user');
+                clearTTSQueue();
+
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    // Tell server if we want audio
+                    ws.send(JSON.stringify({ 
+                        message: message,
+                        audio_enabled: audioEnabled 
+                    }));
+                } else {
+                    messageQueue.push(JSON.stringify({ 
+                        message: message,
+                        audio_enabled: audioEnabled 
+                    }));
+                    addMessage("Connection not ready, message queued", 'system');
+
+                    if (!ws || ws.readyState === WebSocket.CLOSED) {
+                        initWebSocket();
+                    }
+                }
+
+                input.value = '';
+            }
+        }
+
+        async function toggleRecording() {
+            const button = document.getElementById('recordButton');
+
+            if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+                addMessage("Speech recognition not supported", 'system');
+                return;
+            }
+
+            if (!isRecording) {
+                try {
+                    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                    const recognition = new SpeechRecognition();
+
+                    recognition.continuous = false;
+                    recognition.lang = 'en-US';
+
+                    button.style.backgroundColor = '#e74c3c';
+                    addMessage("🎤 Listening...", 'system');
+                    isRecording = true;
+
+                    recognition.onresult = function (event) {
+                        const transcript = event.results[0][0].transcript;
+                        addMessage(`You said: "${transcript}"`, 'user');
+
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ message: transcript }));
+                        }
+                    };
+
+                    recognition.onerror = function (event) {
+                        addMessage(`Speech error: ${event.error}`, 'system');
+                    };
+
+                    recognition.onend = function () {
+                        button.style.backgroundColor = '#667eea';
+                        isRecording = false;
+                    };
+
+                    recognition.start();
+
+                    setTimeout(() => {
+                        if (isRecording) {
+                            recognition.stop();
+                        }
+                    }, 10000);
+
+                } catch (err) {
+                    addMessage('Speech setup failed', 'system');
+                    isRecording = false;
+                }
+            }
+        }
+
+        // Initialize on load
+        window.onload = function () {
+            initWebSocket();
+        };
+    </script>
+</body>
+</html>
