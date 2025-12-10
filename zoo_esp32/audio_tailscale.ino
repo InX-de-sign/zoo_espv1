@@ -17,7 +17,7 @@
 
 // Audio Stream Queue System
 #define MAX_AUDIO_STREAMS 5
-#define STREAM_BUFFER_SIZE 65536  // 64KB per stream
+#define STREAM_BUFFER_SIZE 524288  // 512KB per stream (WAV files are large!)
 
 struct AudioStream {
     uint8_t* data;
@@ -259,9 +259,7 @@ bool audio_received = false;
 String deviceId = CLIENT_ID;
 
 
-// ==================== ADD THESE NEW LINES: ====================
-#define CIRCULAR_BUFFER_SIZE 262144  // 256KB circular buffer in PSRAM
-
+// ==================== GLOBAL OBJECTS ====================
 AudioStreamQueue audioQueue;
 bool isPlayingAudio = false;
 unsigned long currentStreamId = 0;
@@ -433,23 +431,23 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             String text = doc["text"].as<String>();
             Serial.println("💬 AI Response: " + text);
           }
-          else if (msgType == "tts_start") {
-            Serial.println("Audio incoming from server...");
+          else if (msgType == "audio_start" || msgType == "tts_start") {
+            Serial.println("🎵 Audio incoming from server...");
             
             // Start a new stream
             streamCounter++;
             if (audioQueue.startNewStream(streamCounter)) {
-                Serial.printf("Stream %d started\n", streamCounter);
+                Serial.printf("✅ Stream %d started\n", streamCounter);
             } else {
-                Serial.println("❌Failed to start stream - queue full");
+                Serial.println("❌ Failed to start stream - queue full");
             }
           }
-          else if (msgType == "tts_complete") {
+          else if (msgType == "audio_complete" || msgType == "tts_complete") {
               if (audioQueue.getCount() > 0) {  // Only if we have streams
                   audioQueue.completeCurrentStream();
                   
                   if (!isPlayingAudio && audioQueue.hasStreams()) {
-                      Serial.println("Starting playback queue...");
+                      Serial.println("▶️ Starting playback queue...");
                       isPlayingAudio = true;
                   }
               }
@@ -496,29 +494,6 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 }
 
 // ==================== AUDIO FUNCTIONS ====================
-void play_test_tone() {
-  Serial.println("🔊 Playing test tone...");
-  
-  digitalWrite(I2S_SD_SPK, HIGH);
-  delay(50);
-  
-  // Generate 1kHz sine wave
-  int16_t sample_buffer[480];
-  for (int i = 0; i < 480; i++) {
-    float angle = (2.0 * PI * 1000.0 * i) / 16000.0;
-    sample_buffer[i] = (int16_t)(sin(angle) * 10000);  // Loud!
-  }
-  
-  // Play for 2 seconds
-  for (int i = 0; i < 100; i++) {
-    size_t written;
-    i2s_write(I2S_NUM_1, sample_buffer, sizeof(sample_buffer), &written, portMAX_DELAY);
-  }
-  
-  digitalWrite(I2S_SD_SPK, LOW);
-  Serial.println("✅ Test tone complete");
-}
-
 void record_audio() {
   Serial.println("🎤 Recording...");
   
@@ -627,35 +602,33 @@ void send_audio_to_server() {
 
 void play_response_audio() {
     static size_t playbackOffset = 44;  // Skip WAV header
-    static bool headerSkipped = false;
+    static bool headerSkipped = false;  
+    static unsigned long finishTime = 0;  // Track when playback finishes
+    static unsigned long drainDelay = 0;   // Calculated drain time
     
     if (!audioQueue.hasStreams()) {
         if (isPlayingAudio) {
-            // All streams played
             digitalWrite(I2S_SD_SPK, LOW);
             Serial.println("✅ All streams played!");
             isPlayingAudio = false;
             playbackOffset = 44;
             headerSkipped = false;
+            finishTime = 0;
+            drainDelay = 0;
             waiting_for_response = false;
         }
         return;
     }
     
     AudioStream* current = audioQueue.getCurrentPlaybackStream();
-
     if (!current || !current->data) {
-        Serial.println("⏳ Waiting for stream data...");
-        return;  // Exit early if stream not ready
+        return;
     }
 
-    const size_t MIN_BUFFER_SIZE = 4096; 
+    const size_t MIN_BUFFER_SIZE = 4096;
 
-    // Skip header on first call for this stream
     if (!headerSkipped) {
-        // Wait for minimum buffer before starting
         if (current->size < MIN_BUFFER_SIZE) {
-            // Don't spam logs - only show every 10th check
             static int bufferWaitCount = 0;
             if (++bufferWaitCount % 10 == 0) {
                 Serial.printf("⏳ Buffering: %d/%d bytes...\n", current->size, MIN_BUFFER_SIZE);
@@ -663,13 +636,21 @@ void play_response_audio() {
             return;
         }
         
-        Serial.printf("📊 Playing stream (size: %d bytes)\n", current->size);
+        Serial.printf("📊 Playing WAV stream: %d bytes\n", current->size);
+        
+        // Calculate drain time: (samples / sample_rate) * 1000 + buffer margin
+        // WAV data = total - 44 bytes header
+        size_t audioDataBytes = current->size - 44;
+        size_t samples = audioDataBytes / 2;  // 16-bit = 2 bytes per sample
+        drainDelay = (samples * 1000 / SAMPLE_RATE) + 200;  // Add 200ms margin
+        Serial.printf("🕐 Drain delay: %lu ms\n", drainDelay);
+        
         digitalWrite(I2S_SD_SPK, HIGH);
         playbackOffset = 44;
         headerSkipped = true;
+        finishTime = 0;
     }
 
-    // Play one chunk
     const size_t CHUNK_SIZE = 1024;
     
     if (playbackOffset < current->size) {
@@ -680,33 +661,31 @@ void play_response_audio() {
         i2s_write(I2S_NUM_1, current->data + playbackOffset, toPlay, &written, portMAX_DELAY);
         playbackOffset += written;
         
-        // Progress every 10KB
-        if (playbackOffset % 10240 == 0) {
-            float progress = (playbackOffset * 100.0f) / current->size;
-            Serial.printf(" Playing: %.0f%% (%d/%d bytes)\n", 
-                         progress, playbackOffset, current->size);
-        }
+        // Reset finish time since we're still writing
+        finishTime = 0;
     } else {
-        // This stream is finished - but only advance if it's marked complete!
-        if (current->complete || audioQueue.getCount() > 1) {
-            // Either this stream is marked complete, OR there's another stream ready
-            Serial.printf("✅ Stream complete: %d bytes played\n", playbackOffset);
-            
-            audioQueue.advancePlayback();
-            playbackOffset = 44;
-            headerSkipped = false;
-            
-            // NO DELAY - immediately start next stream if available
-            if (!audioQueue.hasStreams()) {
-                digitalWrite(I2S_SD_SPK, LOW);
-                isPlayingAudio = false;
-                waiting_for_response = false;
-            }
-        } else {
-            static unsigned long lastWaitLog = 0;
-            if (millis() - lastWaitLog > 100) {  // Log every 100ms max
-                Serial.println("⏳ Waiting for stream completion...");
-                lastWaitLog = millis();
+        // All data sent - now wait for I2S buffer to drain
+        if (finishTime == 0) {
+            finishTime = millis();
+            Serial.printf("⏳ Waiting %lu ms for I2S buffer to drain...\n", drainDelay);
+        }
+        
+        // Wait for calculated drain time
+        if (millis() - finishTime > drainDelay) {
+            if (current->complete || audioQueue.getCount() > 1) {
+                Serial.printf("✅ Stream complete: %d bytes played\n", playbackOffset);
+                
+                audioQueue.advancePlayback();
+                playbackOffset = 44;
+                headerSkipped = false;
+                finishTime = 0;
+                drainDelay = 0;
+                
+                if (!audioQueue.hasStreams()) {
+                    digitalWrite(I2S_SD_SPK, LOW);
+                    isPlayingAudio = false;
+                    waiting_for_response = false;
+                }
             }
         }
     }
@@ -757,6 +736,7 @@ void setup() {
   i2s_set_pin(I2S_NUM_0, &pin_rx);
   Serial.println("✅ Microphone initialized");
 
+  // I2S Speaker (legacy driver)
   i2s_config_t tx = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = SAMPLE_RATE,
@@ -767,7 +747,7 @@ void setup() {
     .dma_buf_count = 8,
     .dma_buf_len = 1024,
     .use_apll = false,
-    .tx_desc_auto_clear = true,  // ✅ Important for speaker
+    .tx_desc_auto_clear = true,
     .fixed_mclk = 0
   };
   i2s_pin_config_t pin_tx = {
@@ -779,8 +759,6 @@ void setup() {
   i2s_driver_install(I2S_NUM_1, &tx, 0, NULL);
   i2s_set_pin(I2S_NUM_1, &pin_tx);
   Serial.println("✅ Speaker initialized");
-  
-  play_test_tone();
   
   // WiFi
   WiFi.begin(ssid, password);

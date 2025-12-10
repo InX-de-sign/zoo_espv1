@@ -486,21 +486,34 @@ class AudioReceiver:
                     continue
                 
                 try:
-                    # Stream MP3 directly (no conversion!)
-                    logger.info(f"📤 [{phrase_num}/{phrase_count}] Streaming {len(mp3_audio)} bytes MP3")
+                    # Convert MP3 to WAV for ESP32 I2S
+                    logger.info(f"📤 [{phrase_num}/{phrase_count}] Converting and streaming {len(mp3_audio)} bytes MP3→WAV")
+                    
+                    from pydub import AudioSegment
+                    import io
+                    
+                    # Convert MP3 to WAV
+                    audio = AudioSegment.from_mp3(io.BytesIO(mp3_audio))
+                    audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+                    
+                    wav_buffer = io.BytesIO()
+                    audio.export(wav_buffer, format="wav")
+                    wav_bytes = wav_buffer.getvalue()
+                    
+                    logger.info(f"✅ Converted to WAV: {len(wav_bytes)} bytes")
                     
                     chunk_size = 4096
                     await websocket.send_json({
                         "type": "audio_start",
-                        "format": "mp3",
-                        "total_bytes": len(mp3_audio),
+                        "format": "wav",
+                        "total_bytes": len(wav_bytes),
                         "phrase": phrase_num,
                         "total_phrases": phrase_count
                     })
                     
-                    # Stream MP3 chunks
-                    for i in range(0, len(mp3_audio), chunk_size):
-                        chunk = mp3_audio[i:i + chunk_size]
+                    # Stream WAV chunks
+                    for i in range(0, len(wav_bytes), chunk_size):
+                        chunk = wav_bytes[i:i + chunk_size]
                         await websocket.send_bytes(chunk)
                         await asyncio.sleep(0.001)
                     
@@ -531,12 +544,12 @@ class AudioReceiver:
             return (phrase_num, None)
     
     async def _stream_single_phrase_mp3(self, phrase: str, idx: int, total: int, websocket, client_id: str):
-        """⚡ Stream a single phrase using direct MP3 streaming (NO CONVERSION!)"""
+        """⚡ Stream a single phrase with MP3→WAV conversion for ESP32 I2S speaker"""
         try:
-            logger.info(f"🎵 [{idx+1}/{total}] Starting MP3 stream: {phrase[:50]}...")
+            logger.info(f"🎵 [{idx+1}/{total}] Starting WAV stream: {phrase[:50]}...")
             
-            # ⚡ Use new streaming MP3 method - streams as TTS generates!
-            await self.esp32_streamer.stream_mp3_to_esp32(phrase, websocket, client_id)
+            # ✅ Use WAV streaming method - converts MP3→WAV for I2S compatibility!
+            await self.esp32_streamer.stream_response_to_esp32(phrase, websocket, client_id)
             
             logger.info(f"✅ [{idx+1}/{total}] Phrase streamed")
             
