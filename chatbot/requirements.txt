@@ -4,6 +4,7 @@
 dotenv==0.9.9
 fastapi==0.116.1
 httptools==0.6.4
+httpx==0.27.0
 openai==1.101.0
 pi==0.1.2
 PyAudio==0.2.14

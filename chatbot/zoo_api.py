@@ -21,8 +21,9 @@ app = FastAPI(title="Ocean Park Zoo Chatbot API")
 
 # Import components
 from zoo_main import HybridZooAI
-from config import load_azure_openai_config
+from config import load_azure_openai_config, load_tts_config
 from optimized_voice import OptimizedVoiceComponent
+from elevenlabs_voice import ElevenLabsVoice
 from audio_receiver import AudioReceiver
 
 # Store recent detections for each user
@@ -31,13 +32,34 @@ recent_detections: Dict[str, Dict[str, Any]] = {}
 # Initialize components
 openai_config = load_azure_openai_config()
 assistant = HybridZooAI(openai_api_key=openai_config.api_key, db_path="zoo.db")
-voice_component = OptimizedVoiceComponent()
+
+# Initialize STT (always use Google Speech Recognition - it's free and reliable)
+stt_component = OptimizedVoiceComponent()
+logger.info("🎤 STT: Google Speech Recognition")
+
+# Initialize TTS based on config
+tts_config = load_tts_config()
+if tts_config.provider == "elevenlabs":
+    logger.info(f"🔊 TTS: ElevenLabs (voice: {tts_config.elevenlabs_voice}, model: {tts_config.elevenlabs_model})")
+    tts_component = ElevenLabsVoice(
+        api_key=tts_config.elevenlabs_api_key,
+        voice=tts_config.elevenlabs_voice,
+        model=tts_config.elevenlabs_model
+    )
+else:
+    logger.info("🔊 TTS: Google gTTS")
+    tts_component = stt_component  # Use same component for both
+
+# For backward compatibility with AudioReceiver
+voice_component = tts_component
 
 # Initialize audio receiver with ESP32 support
+# Pass STT component separately to ensure Google STT is always used
 audio_receiver = AudioReceiver(
     voice_component=voice_component,
     assistant=assistant,
-    recent_detections=recent_detections 
+    recent_detections=recent_detections,
+    stt_component=stt_component  # Always use Google for STT
 )
 
 # Map camera IDs to audio client IDs
@@ -351,8 +373,8 @@ async def health_check():
         },
         "components": {
             "openai": True,
-            "google_tts": voice_component.tts_available,
-            "google_stt": voice_component.recognizer is not None,
+            "tts": tts_config.provider,
+            "stt": "google",
             "database": os.path.exists(assistant.db_path) if hasattr(assistant, 'db_path') else False
         }
     }

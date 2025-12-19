@@ -36,3 +36,32 @@ def load_azure_openai_config():
 def load_openai_config():
     """Legacy function name - redirects to load_azure_openai_config"""
     return load_azure_openai_config()
+
+@dataclass
+class TTSConfig:
+    """Configuration for Text-to-Speech"""
+    
+    # TTS Provider: "google" or "elevenlabs"
+    provider: str = "google"
+    
+    # ElevenLabs settings
+    elevenlabs_api_key: str = None
+    elevenlabs_voice: str = "rachel"  # Voice name or ID
+    elevenlabs_model: str = "eleven_turbo_v2_5"  # Fast model
+    elevenlabs_stream: bool = True  # Use streaming for faster response
+
+def load_tts_config():
+    """Load TTS configuration"""
+    
+    config = TTSConfig(
+        provider=os.getenv("TTS_PROVIDER", "google").lower(),
+        elevenlabs_api_key=os.getenv("ELEVENLABS_API_KEY"),
+        elevenlabs_voice=os.getenv("ELEVENLABS_VOICE", "rachel"),
+        elevenlabs_model=os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5"),
+        elevenlabs_stream=os.getenv("ELEVENLABS_STREAM", "true").lower() == "true"
+    )
+    
+    if config.provider == "elevenlabs" and not config.elevenlabs_api_key:
+        raise ValueError("ELEVENLABS_API_KEY required when TTS_PROVIDER=elevenlabs")
+    
+    return config

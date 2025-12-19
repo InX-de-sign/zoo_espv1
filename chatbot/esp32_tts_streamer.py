@@ -101,10 +101,17 @@ class ESP32TTSStreamer:
             # Load MP3
             audio = AudioSegment.from_mp3(io.BytesIO(mp3_bytes))
 
-            audio = audio.set_frame_rate(16000)  # ESP32 target rate
+            # ElevenLabs optimization: Lower sample rate for smaller files
+            audio = audio.set_frame_rate(8000)   # 8kHz saves bandwidth (still clear for speech)
             audio = audio.set_channels(1)        # Mono
             audio = audio.set_sample_width(2)    # 16-bit
-            audio = audio.speedup(playback_speed=1.2)
+            
+            # Optional speedup (configurable via AUDIO_SPEED env var)
+            import os
+            speed = float(os.getenv('AUDIO_SPEED', '1.0'))
+            if speed != 1.0:
+                audio = audio.speedup(playback_speed=speed)
+                logger.info(f"   Speed: {speed}x")
             
             # Export as WAV
             wav_buffer = io.BytesIO()
@@ -114,7 +121,7 @@ class ESP32TTSStreamer:
             wav_bytes = wav_buffer.getvalue()
             
             logger.info(f"🎵 Audio conversion: {len(mp3_bytes)} bytes MP3 → {len(wav_bytes)} bytes WAV")
-            logger.info(f"   Format: 16kHz, Mono, 16-bit")
+            logger.info(f"   Format: 8kHz, Mono, 16-bit (optimized for ESP32)")
             
             return wav_bytes
             

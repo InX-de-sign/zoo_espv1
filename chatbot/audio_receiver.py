@@ -19,8 +19,9 @@ logger = logging.getLogger(__name__)
 class AudioReceiver:
     """Receives audio from clients and streams TTS responses"""
     
-    def __init__(self, voice_component, assistant=None, tts_connections=None, stream_func=None, recent_detections=None):
-        self.voice_component = voice_component
+    def __init__(self, voice_component, assistant=None, tts_connections=None, stream_func=None, recent_detections=None, stt_component=None):
+        self.voice_component = voice_component  # TTS component
+        self.stt_component = stt_component or voice_component  # STT component (defaults to voice_component for backward compatibility)
         self.assistant = assistant
         self.tts_connections = tts_connections
         self.stream_func = stream_func
@@ -614,7 +615,7 @@ class AudioReceiver:
                                 
     async def _google_stt(self, audio_bytes: bytes) -> Optional[str]:
         """Google Speech Recognition"""
-        if not self.voice_component:
+        if not self.stt_component:
             return None
         
         if len(audio_bytes) < 10000:
@@ -622,10 +623,10 @@ class AudioReceiver:
             return None
         
         try:
-            logger.info(f"🎙️ Running STT on {len(audio_bytes)} bytes...")
+            logger.info(f"🎙️ Running Google STT on {len(audio_bytes)} bytes...")
             
             text = await asyncio.wait_for(
-                self.voice_component.process_audio_to_text_async(
+                self.stt_component.process_audio_to_text_async(
                     audio_bytes,
                     "audio/wav"
                 ),
